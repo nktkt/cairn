@@ -117,6 +117,7 @@ cc -std=c11 -Wall -Wextra -Werror \
 If the checkpoint was written after loading a dataset manifest, pass the same manifest as a final argument so restore can verify and recover the dataset cursor.
 
 By default the runtime reserves arena metadata only. Set `CAIRN_ALLOCATE_HOST_ARENA=1` to allocate the full host arena for small local smoke plans that need tensor staging or `cairn_copy_tensor_bytes` inspection. In that mode, the runtime also applies deterministic host-side tensor effects for planned ops so smoke runs can verify dataflow through activation, communication, gradient, and optimizer tensors before GPU kernels exist.
+Host-arena checkpoints include a rank-local binary arena snapshot with an FNV-1a integrity hash, and restore reloads that snapshot when the host arena is allocated.
 
 The smoke runtime writes checkpoint artifacts in a shard-like layout:
 
@@ -127,6 +128,7 @@ The smoke runtime writes checkpoint artifacts in a shard-like layout:
     manifest.json
     ranks/
       rank_000000.json
+      rank_000000.arena
 ```
 
 It also writes one deterministic JSONL trace event per executed op when `TRACE_OUT` is provided.

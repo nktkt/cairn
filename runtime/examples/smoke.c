@@ -335,6 +335,30 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    if (cairn_host_arena_allocated(ctx)) {
+        if (expect_ok(cairn_copy_tensor_bytes(ctx, "activation_slot_0", 0, staged_token, sizeof(staged_token)),
+                      "cairn_copy_tensor_bytes_restore_activation",
+                      ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (read_u32_le(staged_token) == 0) {
+            fprintf(stderr, "checkpoint restore did not recover activation tensor snapshot\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (expect_ok(cairn_copy_tensor_bytes(ctx, "gradients_shard", 0, staged_token, sizeof(staged_token)),
+                      "cairn_copy_tensor_bytes_restore_gradients",
+                      ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (read_u32_le(staged_token) == 0) {
+            fprintf(stderr, "checkpoint restore did not recover gradient tensor snapshot\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
+    }
     if (expect_ok(cairn_finalize(ctx), "cairn_finalize_restore", ctx)) {
         return 1;
     }

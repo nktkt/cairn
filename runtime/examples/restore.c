@@ -81,6 +81,41 @@ int main(int argc, char **argv) {
             return 1;
         }
     }
+    if (cairn_host_arena_allocated(ctx) && cairn_plan_tensor_count(ctx) > 0) {
+        if (expect_ok(cairn_copy_tensor_bytes(ctx, "input_tokens", 0, token_buffer, 4),
+                      "cairn_copy_tensor_bytes_input_tokens",
+                      ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (read_u32_le(token_buffer) != 0) {
+            fprintf(stderr, "checkpoint restore did not recover input token tensor bytes\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (expect_ok(cairn_copy_tensor_bytes(ctx, "activation_slot_0", 0, token_buffer, 4),
+                      "cairn_copy_tensor_bytes_activation",
+                      ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (read_u32_le(token_buffer) == 0) {
+            fprintf(stderr, "checkpoint restore did not recover activation tensor bytes\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (expect_ok(cairn_copy_tensor_bytes(ctx, "gradients_shard", 0, token_buffer, 4),
+                      "cairn_copy_tensor_bytes_gradients",
+                      ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (read_u32_le(token_buffer) == 0) {
+            fprintf(stderr, "checkpoint restore did not recover gradient tensor bytes\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
+    }
     if (expect_ok(cairn_finalize(ctx), "cairn_finalize", ctx)) {
         return 1;
     }

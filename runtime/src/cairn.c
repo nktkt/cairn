@@ -430,6 +430,53 @@ static int atomic_publish(const char *tmp_path, const char *final_path) {
     return 1;
 }
 
+static uint64_t hash_bytes_fnv1a64(const unsigned char *bytes, uint64_t nbytes) {
+    uint64_t hash;
+    uint64_t index;
+
+    hash = 1469598103934665603ull;
+    if (bytes == NULL && nbytes > 0) {
+        return 0;
+    }
+    for (index = 0; index < nbytes; index++) {
+        hash ^= (uint64_t)bytes[index];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static int write_binary_atomic(cairn_context_t *ctx, const char *path, const void *data, uint64_t nbytes) {
+    FILE *file;
+    char tmp_path[CAIRN_PATH_MAX];
+
+    if (ctx == NULL || path == NULL || path[0] == '\0' || data == NULL || nbytes == 0) {
+        return 0;
+    }
+    if ((uint64_t)((size_t)nbytes) != nbytes) {
+        return set_error(ctx, CAIRN_ERR_IO, "binary checkpoint payload is too large for this host");
+    }
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) <= 0 || strlen(path) + 4 >= sizeof(tmp_path)) {
+        return set_error(ctx, CAIRN_ERR_IO, "binary checkpoint temporary path is too long");
+    }
+    file = fopen(tmp_path, "wb");
+    if (file == NULL) {
+        return set_error(ctx, CAIRN_ERR_IO, "binary checkpoint payload could not be opened for writing");
+    }
+    if (fwrite(data, 1, (size_t)nbytes, file) != (size_t)nbytes) {
+        fclose(file);
+        remove(tmp_path);
+        return set_error(ctx, CAIRN_ERR_IO, "binary checkpoint payload could not be written");
+    }
+    if (fclose(file) != 0) {
+        remove(tmp_path);
+        return set_error(ctx, CAIRN_ERR_IO, "binary checkpoint payload could not be closed");
+    }
+    if (!atomic_publish(tmp_path, path)) {
+        return set_error(ctx, CAIRN_ERR_IO, "binary checkpoint payload could not be published");
+    }
+    return CAIRN_OK;
+}
+
 static uint64_t count_occurrences_range(const char *text, const char *end, const char *needle) {
     uint64_t count;
     size_t needle_len;
@@ -1278,15 +1325,85 @@ static int restore_checkpoint_contents(cairn_context_t *ctx, const char *content
     return CAIRN_OK;
 }
 
+static int restore_checkpoint_arena_data(cairn_context_t *ctx, const char *contents, const char *rank_shard_path) {
+    char arena_rel[CAIRN_PATH_MAX];
+    char rank_dir[CAIRN_PATH_MAX];
+    char arena_path[CAIRN_PATH_MAX];
+    char *arena_contents;
+    size_t arena_size;
+    uint64_t parsed;
+    uint64_t expected_hash;
+    uint64_t actual_hash;
+    int arena_data_saved;
+
+    if (ctx == NULL || contents == NULL || rank_shard_path == NULL || rank_shard_path[0] == '\0') {
+        return CAIRN_ERR_INVALID_ARGUMENT;
+    }
+    arena_data_saved = 0;
+    if (!parse_json_bool(contents, "arena_data_saved", &arena_data_saved) || !arena_data_saved) {
+        return CAIRN_OK;
+    }
+    if (!ctx->arena_allocated || ctx->arena == NULL) {
+        return CAIRN_OK;
+    }
+    if (!parse_json_string(contents, "arena_data_path", arena_rel, sizeof(arena_rel))) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint arena data path is missing");
+    }
+    if (!parse_json_u64(contents, "arena_data_nbytes", &parsed) || parsed != ctx->arena_bytes) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint arena data size does not match loaded plan");
+    }
+    if (!parse_json_u64(contents, "arena_data_fnv1a64", &expected_hash)) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint arena data hash is missing");
+    }
+    if (!dirname_of(rank_dir, sizeof(rank_dir), rank_shard_path)) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint rank shard directory is invalid");
+    }
+    if (!join_path(arena_path, sizeof(arena_path), rank_dir, arena_rel)) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint arena data path is too long");
+    }
+    arena_contents = read_file(arena_path, &arena_size);
+    if (arena_contents == NULL || (uint64_t)arena_size != ctx->arena_bytes) {
+        free(arena_contents);
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint arena data could not be read or has unexpected size");
+    }
+    actual_hash = hash_bytes_fnv1a64((const unsigned char *)arena_contents, ctx->arena_bytes);
+    if (actual_hash != expected_hash) {
+        free(arena_contents);
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint arena data hash does not match");
+    }
+    memcpy(ctx->arena, arena_contents, (size_t)ctx->arena_bytes);
+    free(arena_contents);
+    return CAIRN_OK;
+}
+
 static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     FILE *file;
     char tmp_path[CAIRN_PATH_MAX];
+    char rank_dir[CAIRN_PATH_MAX];
+    char arena_file_name[64];
+    char arena_path[CAIRN_PATH_MAX];
+    uint64_t arena_hash;
     uint32_t dataset_cursor_shard_index;
     uint64_t dataset_cursor_shard_token_offset;
     uint64_t dataset_cursor_tokens_available;
 
     if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) <= 0 || strlen(path) + 4 >= sizeof(tmp_path)) {
         return set_error(ctx, CAIRN_ERR_IO, "rank checkpoint temporary path is too long");
+    }
+    arena_file_name[0] = '\0';
+    arena_hash = 0;
+    if (ctx->arena_allocated && ctx->arena != NULL && ctx->arena_bytes > 0) {
+        snprintf(arena_file_name, sizeof(arena_file_name), "rank_%06u.arena", ctx->desc.global_rank);
+        if (!dirname_of(rank_dir, sizeof(rank_dir), path)) {
+            return set_error(ctx, CAIRN_ERR_IO, "rank checkpoint directory is invalid");
+        }
+        if (!join_path(arena_path, sizeof(arena_path), rank_dir, arena_file_name)) {
+            return set_error(ctx, CAIRN_ERR_IO, "rank checkpoint arena path is too long");
+        }
+        arena_hash = hash_bytes_fnv1a64((const unsigned char *)ctx->arena, ctx->arena_bytes);
+        if (write_binary_atomic(ctx, arena_path, ctx->arena, ctx->arena_bytes) != CAIRN_OK) {
+            return CAIRN_ERR_IO;
+        }
     }
     dataset_cursor_shard_index = 0;
     dataset_cursor_shard_token_offset = 0;
@@ -1330,6 +1447,10 @@ static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     fprintf(file, "  \"dataset_cursor_tokens_available\": %llu,\n", (unsigned long long)dataset_cursor_tokens_available);
     fprintf(file, "  \"arena_bytes\": %llu,\n", (unsigned long long)ctx->arena_bytes);
     fprintf(file, "  \"arena_allocated\": %s,\n", ctx->arena_allocated ? "true" : "false");
+    fprintf(file, "  \"arena_data_saved\": %s,\n", arena_file_name[0] != '\0' ? "true" : "false");
+    fprintf(file, "  \"arena_data_path\": \"%s\",\n", arena_file_name);
+    fprintf(file, "  \"arena_data_nbytes\": %llu,\n", arena_file_name[0] != '\0' ? (unsigned long long)ctx->arena_bytes : 0ull);
+    fprintf(file, "  \"arena_data_fnv1a64\": %llu,\n", (unsigned long long)arena_hash);
     fprintf(file, "  \"ops_executed\": %llu,\n", (unsigned long long)ctx->stats.ops_executed);
     fprintf(file, "  \"compute_ops\": %llu,\n", (unsigned long long)ctx->stats.compute_ops);
     fprintf(file, "  \"communication_ops\": %llu,\n", (unsigned long long)ctx->stats.communication_ops);
@@ -2050,6 +2171,7 @@ int cairn_load_checkpoint(cairn_context_t *ctx, const char *path) {
     if (ctx->finalized) {
         return set_error(ctx, CAIRN_ERR_STATE, "context is finalized");
     }
+    rank_shard_path[0] = '\0';
     if (!ctx->dataset_loaded && ctx->desc.dataset_manifest_path != NULL && ctx->desc.dataset_manifest_path[0] != '\0') {
         status = cairn_load_dataset(ctx, ctx->desc.dataset_manifest_path);
         if (status != CAIRN_OK) {
@@ -2102,6 +2224,9 @@ int cairn_load_checkpoint(cairn_context_t *ctx, const char *path) {
         }
         contents = read_file(rank_shard_path, &contents_size);
     } else {
+        if (snprintf(rank_shard_path, sizeof(rank_shard_path), "%s", path) <= 0 || strlen(path) >= sizeof(rank_shard_path)) {
+            return set_error(ctx, CAIRN_ERR_IO, "checkpoint rank shard path is too long");
+        }
         contents = read_file(path, &contents_size);
     }
     if (contents == NULL || contents_size == 0) {
@@ -2109,6 +2234,11 @@ int cairn_load_checkpoint(cairn_context_t *ctx, const char *path) {
         return set_error(ctx, CAIRN_ERR_IO, "checkpoint file could not be read");
     }
     status = restore_checkpoint_contents(ctx, contents);
+    if (status != CAIRN_OK) {
+        free(contents);
+        return status;
+    }
+    status = restore_checkpoint_arena_data(ctx, contents, rank_shard_path);
     free(contents);
     if (status != CAIRN_OK) {
         return status;

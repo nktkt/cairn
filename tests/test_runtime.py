@@ -157,6 +157,13 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(checkpoint_data["dataset_cursor_shard_token_offset"], 0)
             self.assertEqual(checkpoint_data["dataset_cursor_tokens_available"], 8)
             self.assertGreaterEqual(checkpoint_data["arena_bytes"], checkpoint_data["estimated_memory_bytes"])
+            self.assertTrue(checkpoint_data["arena_data_saved"])
+            self.assertEqual(checkpoint_data["arena_data_path"], "rank_000000.arena")
+            self.assertEqual(checkpoint_data["arena_data_nbytes"], checkpoint_data["arena_bytes"])
+            self.assertGreater(checkpoint_data["arena_data_fnv1a64"], 0)
+            arena_payload = rank_shard.parent / checkpoint_data["arena_data_path"]
+            self.assertTrue(arena_payload.exists())
+            self.assertEqual(arena_payload.stat().st_size, checkpoint_data["arena_bytes"])
             self.assertGreater(checkpoint_data["compute_ops"], 0)
             self.assertGreater(checkpoint_data["communication_ops"], 0)
             self.assertGreater(checkpoint_data["io_ops"], 0)
@@ -166,6 +173,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             restore_result = subprocess.run(
                 [str(restore_binary), str(binary_plan), "8", str(checkpoint), str(dataset_manifest)],
                 cwd=ROOT,
+                env={**os.environ, "CAIRN_ALLOCATE_HOST_ARENA": "1"},
                 text=True,
                 capture_output=True,
                 check=False,
