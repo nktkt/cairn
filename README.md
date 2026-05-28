@@ -35,11 +35,11 @@ The current implementation includes:
 
 - `cairn validate` for model, training, topology, dataset, and checkpoint specs
 - `cairn map` for deterministic physical/logical rank mapping
-- `cairn compile` for deterministic static plan generation, including inspectable JSON rank plans and C-runtime `.cairn` rank binaries
+- `cairn compile` for deterministic static plan generation, including inspectable JSON rank plans and C-runtime `.cairn` rank binaries with tensor and dependency metadata
 - `cairn simulate` for pipeline, memory, communication, checkpoint, and failure-injection reports
 - `cairn report` for compact report summaries
 - a shared op registry used by both the Python compiler and C runtime
-- a C ABI/runtime dry-run skeleton that loads rank plans, validates memory segments, reserves arena metadata, rejects unsupported op kinds or registry mismatches, executes op tables, records stats, and writes checkpoint manifests
+- a C ABI/runtime dry-run skeleton that loads rank plans, validates memory segments, tensor placement, dependency edges, op classes, and registry hashes, reserves arena metadata, executes op tables, records stats, and writes checkpoint manifests
 - small example specs under [examples/small](examples/small)
 - unit tests and GitHub Actions CI
 

@@ -26,11 +26,20 @@ OP_CLASS_IDS = {
     "io": 2,
 }
 
+DTYPE_IDS = {
+    "fp8": 1,
+    "bf16": 2,
+    "uint64": 3,
+    "bytes": 4,
+}
+
 BINARY_PLAN_MAGIC = b"CAIRNPLN"
-BINARY_PLAN_VERSION = 1
-BINARY_PLAN_HEADER = struct.Struct("<8sII64s64sIIIIIQQ")
+BINARY_PLAN_VERSION = 2
+BINARY_PLAN_HEADER = struct.Struct("<8sII64s64sIIIIIIIIQQ")
 BINARY_PLAN_SEGMENT = struct.Struct("<64sQQ")
-BINARY_PLAN_OP = struct.Struct("<II48s32sQ")
+BINARY_PLAN_TENSOR = struct.Struct("<II64s64sQQI4Q")
+BINARY_PLAN_OP = struct.Struct("<II48s32sQIIIIIII")
+BINARY_PLAN_REF = struct.Struct("<I")
 
 
 def compile_plan(
@@ -177,6 +186,8 @@ def build_rank_plan(
     data = training["parallelism"]["data"]
     assignment = layer_assignments[pp]
     ops: list[dict[str, Any]] = []
+    tensors = build_tensor_table(model, training, memory)
+    tensor_ids = {tensor["name"]: tensor["tensor_id"] for tensor in tensors}
 
     op_id = 0
     for layer in range(assignment["layer_start"], assignment["layer_end"]):
@@ -210,6 +221,7 @@ def build_rank_plan(
     ops.append(op(op_id, "optimizer", "compute_lo", bytes=memory["estimated_bytes_per_rank"] // 3))
     op_id += 1
     ops.append(op(op_id, "checkpoint_stage", "io", bytes=memory["estimated_bytes_per_rank"] // 2))
+    annotate_ops(ops, tensor_ids)
 
     return {
         "version": 1,
@@ -231,6 +243,7 @@ def build_rank_plan(
             "estimated_bytes_per_rank": memory["estimated_bytes_per_rank"],
             "segments": memory["segments"],
         },
+        "tensors": tensors,
         "ops": ops,
     }
 
@@ -256,10 +269,172 @@ def gradient_bytes(model: dict[str, Any], training: dict[str, Any]) -> int:
     return model["hidden_size"] * model["hidden_size"] * dtype_size // max(1, training["parallelism"]["tensor"])
 
 
+def build_tensor_table(model: dict[str, Any], training: dict[str, Any], memory: dict[str, Any]) -> list[dict[str, Any]]:
+    segments = {segment["name"]: segment for segment in memory["segments"]}
+    tensors: list[dict[str, Any]] = []
+
+    def add_tensor(
+        name: str,
+        role: str,
+        segment_name: str,
+        segment_offset: int,
+        nbytes: int,
+        dtype: str,
+        shape: list[int],
+    ) -> None:
+        segment = segments[segment_name]
+        if nbytes <= 0:
+            raise ValueError(f"tensor {name} must have positive nbytes")
+        if segment_offset < 0 or segment_offset + nbytes > segment["nbytes"]:
+            raise ValueError(f"tensor {name} does not fit in memory segment {segment_name}")
+        tensors.append(
+            {
+                "tensor_id": len(tensors),
+                "name": name,
+                "role": role,
+                "segment": segment_name,
+                "offset": segment["offset"] + segment_offset,
+                "nbytes": nbytes,
+                "dtype": dtype,
+                "shape": shape,
+            }
+        )
+
+    precision = training["precision"]
+    activation_nbytes = align(activation_bytes(model, training), 256)
+    activation_segment = segments["activation_ring"]
+    activation_slots = max(1, min(2, activation_segment["nbytes"] // activation_nbytes))
+
+    add_tensor(
+        "params_shard",
+        "params",
+        "params_shard",
+        0,
+        segments["params_shard"]["nbytes"],
+        precision,
+        [segments["params_shard"]["nbytes"] // dtype_size_bytes(precision)],
+    )
+    add_tensor(
+        "gradients_shard",
+        "gradients",
+        "gradients_shard",
+        0,
+        segments["gradients_shard"]["nbytes"],
+        precision,
+        [segments["gradients_shard"]["nbytes"] // dtype_size_bytes(precision)],
+    )
+    add_tensor(
+        "optimizer_state_shard",
+        "optimizer_state",
+        "optimizer_state_shard",
+        0,
+        segments["optimizer_state_shard"]["nbytes"],
+        "bf16",
+        [segments["optimizer_state_shard"]["nbytes"] // dtype_size_bytes("bf16")],
+    )
+    for slot in range(activation_slots):
+        add_tensor(
+            f"activation_slot_{slot}",
+            "activation",
+            "activation_ring",
+            slot * activation_nbytes,
+            activation_nbytes,
+            precision,
+            [training["microbatch_size"], model["sequence_length"], model["hidden_size"]],
+        )
+    add_tensor(
+        "comm_scratch",
+        "communication",
+        "comm_scratch",
+        0,
+        segments["comm_scratch"]["nbytes"],
+        "bytes",
+        [segments["comm_scratch"]["nbytes"]],
+    )
+    add_tensor(
+        "attention_workspace",
+        "workspace",
+        "attention_workspace",
+        0,
+        segments["attention_workspace"]["nbytes"],
+        "bytes",
+        [segments["attention_workspace"]["nbytes"]],
+    )
+    add_tensor(
+        "rng_state",
+        "rng",
+        "rng_and_metrics",
+        0,
+        segments["rng_and_metrics"]["nbytes"],
+        "uint64",
+        [segments["rng_and_metrics"]["nbytes"] // dtype_size_bytes("uint64")],
+    )
+    return tensors
+
+
+def dtype_size_bytes(dtype: str) -> int:
+    return {
+        "fp8": 1,
+        "bf16": 2,
+        "uint64": 8,
+        "bytes": 1,
+    }[dtype]
+
+
+def annotate_ops(ops: list[dict[str, Any]], tensor_ids: dict[str, int]) -> None:
+    activation = tensor_ids["activation_slot_0"]
+    comm = tensor_ids["comm_scratch"]
+    params = tensor_ids["params_shard"]
+    gradients = tensor_ids["gradients_shard"]
+    optimizer_state = tensor_ids["optimizer_state_shard"]
+    attention_workspace = tensor_ids["attention_workspace"]
+    rng = tensor_ids["rng_state"]
+
+    for item in ops:
+        kind = item["kind"]
+        item["tick"] = item["op_id"]
+        item["deps"] = [] if item["op_id"] == 0 else [item["op_id"] - 1]
+        if kind == "rmsnorm":
+            item["input_tensors"] = [activation, params]
+            item["output_tensors"] = [activation]
+        elif kind == "attention_fwd":
+            item["input_tensors"] = [activation, params, attention_workspace]
+            item["output_tensors"] = [activation]
+        elif kind == "mlp_fwd":
+            item["input_tensors"] = [activation, params]
+            item["output_tensors"] = [activation]
+        elif kind == "pipe_send_activation":
+            item["input_tensors"] = [activation]
+            item["output_tensors"] = [comm]
+        elif kind == "pipe_recv_activation_grad":
+            item["input_tensors"] = [comm]
+            item["output_tensors"] = [activation]
+        elif kind in {"mlp_bwd", "attention_bwd"}:
+            inputs = [activation, params]
+            if kind == "attention_bwd":
+                inputs.append(attention_workspace)
+            item["input_tensors"] = inputs
+            item["output_tensors"] = [gradients]
+        elif kind in {"all_reduce", "reduce_scatter", "all_gather"}:
+            item["input_tensors"] = [gradients, comm]
+            item["output_tensors"] = [gradients]
+        elif kind == "optimizer":
+            item["input_tensors"] = [params, gradients, optimizer_state]
+            item["output_tensors"] = [params, optimizer_state]
+        elif kind == "checkpoint_stage":
+            item["input_tensors"] = [params, optimizer_state, rng]
+            item["output_tensors"] = []
+        else:
+            raise ValueError(f"unsupported op kind for tensor annotation: {kind}")
+
+
 def write_binary_rank_plan(path: Path, rank_plan: dict[str, Any]) -> None:
     segments = rank_plan["memory"]["segments"]
+    tensors = rank_plan["tensors"]
     ops = rank_plan["ops"]
     arena_bytes = arena_bytes_from_segments(segments)
+    dependency_refs = [dep for item in ops for dep in item["deps"]]
+    tensor_refs = [tensor for item in ops for key in ("input_tensors", "output_tensors") for tensor in item[key]]
     chunks = [
         BINARY_PLAN_HEADER.pack(
             BINARY_PLAN_MAGIC,
@@ -272,6 +447,9 @@ def write_binary_rank_plan(path: Path, rank_plan: dict[str, Any]) -> None:
             rank_plan["microbatch_size"],
             len(ops),
             len(segments),
+            len(tensors),
+            len(dependency_refs),
+            len(tensor_refs),
             rank_plan["memory"]["estimated_bytes_per_rank"],
             arena_bytes,
         )
@@ -284,7 +462,27 @@ def write_binary_rank_plan(path: Path, rank_plan: dict[str, Any]) -> None:
                 segment["nbytes"],
             )
         )
+    for tensor in tensors:
+        shape = tensor["shape"]
+        if len(shape) > 4:
+            raise ValueError(f"tensor shape rank exceeds binary format limit: {tensor['name']}")
+        chunks.append(
+            BINARY_PLAN_TENSOR.pack(
+                tensor["tensor_id"],
+                DTYPE_IDS[tensor["dtype"]],
+                fixed_bytes(tensor["name"], 64),
+                fixed_bytes(tensor["segment"], 64),
+                tensor["offset"],
+                tensor["nbytes"],
+                len(shape),
+                *(shape + ([0] * (4 - len(shape)))),
+            )
+        )
+    dep_first = 0
+    tensor_ref_first = 0
     for item in ops:
+        input_count = len(item["input_tensors"])
+        output_count = len(item["output_tensors"])
         chunks.append(
             BINARY_PLAN_OP.pack(
                 item["op_id"],
@@ -292,8 +490,21 @@ def write_binary_rank_plan(path: Path, rank_plan: dict[str, Any]) -> None:
                 fixed_bytes(item["kind"], 48),
                 fixed_bytes(item["stream"], 32),
                 item.get("bytes", 0),
+                item["tick"],
+                dep_first,
+                len(item["deps"]),
+                tensor_ref_first,
+                input_count,
+                tensor_ref_first + input_count,
+                output_count,
             )
         )
+        dep_first += len(item["deps"])
+        tensor_ref_first += input_count + output_count
+    for dep in dependency_refs:
+        chunks.append(BINARY_PLAN_REF.pack(dep))
+    for tensor in tensor_refs:
+        chunks.append(BINARY_PLAN_REF.pack(tensor))
     path.write_bytes(b"".join(chunks))
 
 

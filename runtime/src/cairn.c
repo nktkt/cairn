@@ -12,14 +12,23 @@
 #define CAIRN_PATH_MAX 1024
 #define CAIRN_BINARY_PLAN_MAGIC "CAIRNPLN"
 #define CAIRN_BINARY_PLAN_MAGIC_SIZE 8
-#define CAIRN_BINARY_PLAN_VERSION 1
-#define CAIRN_BINARY_PLAN_HEADER_SIZE 180
+#define CAIRN_BINARY_PLAN_VERSION 2
+#define CAIRN_BINARY_PLAN_HEADER_SIZE 192
 #define CAIRN_BINARY_PLAN_SEGMENT_SIZE 80
-#define CAIRN_BINARY_PLAN_OP_SIZE 96
+#define CAIRN_BINARY_PLAN_TENSOR_SIZE 188
+#define CAIRN_BINARY_PLAN_OP_SIZE 124
+#define CAIRN_BINARY_PLAN_REF_SIZE 4
 
 typedef struct {
     uint64_t op_id;
     uint64_t bytes;
+    uint32_t tick;
+    uint32_t dep_first;
+    uint32_t dep_count;
+    uint32_t input_first;
+    uint32_t input_count;
+    uint32_t output_first;
+    uint32_t output_count;
     cairn_op_class_t op_class;
     char kind[48];
     char stream[32];
@@ -30,6 +39,17 @@ typedef struct {
     uint64_t nbytes;
     char name[64];
 } cairn_memory_segment_t;
+
+typedef struct {
+    uint64_t offset;
+    uint64_t nbytes;
+    uint64_t shape[4];
+    uint32_t tensor_id;
+    uint32_t dtype_id;
+    uint32_t shape_rank;
+    char name[64];
+    char segment[64];
+} cairn_tensor_t;
 
 struct cairn_context {
     cairn_init_desc_t desc;
@@ -44,7 +64,13 @@ struct cairn_context {
     uint32_t plan_microbatch_size;
     cairn_plan_op_t *ops;
     cairn_memory_segment_t *segments;
+    cairn_tensor_t *tensors;
+    uint32_t *dependency_refs;
+    uint32_t *tensor_refs;
     uint64_t segment_count;
+    uint64_t tensor_count;
+    uint64_t dependency_ref_count;
+    uint64_t tensor_ref_count;
     uint64_t arena_bytes;
     void *arena;
     int arena_allocated;
@@ -411,6 +437,40 @@ static int stream_matches_class(const char *stream, cairn_op_class_t op_class) {
         return stream_is_comm(stream);
     }
     return stream_is_compute(stream);
+}
+
+static int dtype_id_is_valid(uint32_t dtype_id) {
+    return dtype_id >= 1 && dtype_id <= 4;
+}
+
+static int tensor_fits_segment(
+    const cairn_tensor_t *tensor,
+    const cairn_memory_segment_t *segments,
+    uint64_t segment_count
+) {
+    uint64_t index;
+
+    if (tensor == NULL || segments == NULL || tensor->nbytes == 0) {
+        return 0;
+    }
+    if (UINT64_MAX - tensor->offset < tensor->nbytes) {
+        return 0;
+    }
+    for (index = 0; index < segment_count; index++) {
+        uint64_t segment_end;
+        uint64_t tensor_end;
+
+        if (strcmp(tensor->segment, segments[index].name) != 0) {
+            continue;
+        }
+        if (UINT64_MAX - segments[index].offset < segments[index].nbytes) {
+            return 0;
+        }
+        segment_end = segments[index].offset + segments[index].nbytes;
+        tensor_end = tensor->offset + tensor->nbytes;
+        return tensor->offset >= segments[index].offset && tensor_end <= segment_end;
+    }
+    return 0;
 }
 
 static const char *find_matching_bracket(const char *open) {
@@ -826,6 +886,9 @@ static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     fprintf(file, "  \"op_count\": %llu,\n", (unsigned long long)ctx->op_count);
     fprintf(file, "  \"estimated_memory_bytes\": %llu,\n", (unsigned long long)ctx->estimated_memory_bytes);
     fprintf(file, "  \"memory_segment_count\": %llu,\n", (unsigned long long)ctx->segment_count);
+    fprintf(file, "  \"tensor_count\": %llu,\n", (unsigned long long)ctx->tensor_count);
+    fprintf(file, "  \"dependency_ref_count\": %llu,\n", (unsigned long long)ctx->dependency_ref_count);
+    fprintf(file, "  \"tensor_ref_count\": %llu,\n", (unsigned long long)ctx->tensor_ref_count);
     fprintf(file, "  \"arena_bytes\": %llu,\n", (unsigned long long)ctx->arena_bytes);
     fprintf(file, "  \"arena_allocated\": %s,\n", ctx->arena_allocated ? "true" : "false");
     fprintf(file, "  \"ops_executed\": %llu,\n", (unsigned long long)ctx->stats.ops_executed);
@@ -854,10 +917,19 @@ static void clear_plan(cairn_context_t *ctx) {
     ctx->ops = NULL;
     free(ctx->segments);
     ctx->segments = NULL;
+    free(ctx->tensors);
+    ctx->tensors = NULL;
+    free(ctx->dependency_refs);
+    ctx->dependency_refs = NULL;
+    free(ctx->tensor_refs);
+    ctx->tensor_refs = NULL;
     free(ctx->arena);
     ctx->arena = NULL;
     ctx->op_count = 0;
     ctx->segment_count = 0;
+    ctx->tensor_count = 0;
+    ctx->dependency_ref_count = 0;
+    ctx->tensor_ref_count = 0;
     ctx->estimated_memory_bytes = 0;
     ctx->arena_bytes = 0;
     ctx->arena_allocated = 0;
@@ -873,10 +945,16 @@ static int fail_binary_plan(
     cairn_context_t *ctx,
     cairn_plan_op_t *ops,
     cairn_memory_segment_t *segments,
+    cairn_tensor_t *tensors,
+    uint32_t *dependency_refs,
+    uint32_t *tensor_refs,
     const char *message
 ) {
     free(ops);
     free(segments);
+    free(tensors);
+    free(dependency_refs);
+    free(tensor_refs);
     return set_error(ctx, CAIRN_ERR_PLAN, message);
 }
 
@@ -890,6 +968,9 @@ static int load_binary_rank_plan(cairn_context_t *ctx, const unsigned char *cont
     uint32_t loaded_microbatch_size;
     uint32_t loaded_op_count;
     uint32_t loaded_segment_count;
+    uint32_t loaded_tensor_count;
+    uint32_t loaded_dependency_ref_count;
+    uint32_t loaded_tensor_ref_count;
     uint64_t loaded_memory_bytes;
     uint64_t loaded_arena_bytes;
     uint64_t computed_arena_bytes;
@@ -898,6 +979,9 @@ static int load_binary_rank_plan(cairn_context_t *ctx, const unsigned char *cont
     char loaded_plan_id[65];
     cairn_plan_op_t *loaded_ops;
     cairn_memory_segment_t *loaded_segments;
+    cairn_tensor_t *loaded_tensors;
+    uint32_t *loaded_dependency_refs;
+    uint32_t *loaded_tensor_refs;
     uint32_t index;
 
     if (ctx == NULL || contents == NULL) {
@@ -933,6 +1017,12 @@ static int load_binary_rank_plan(cairn_context_t *ctx, const unsigned char *cont
     offset += 4;
     loaded_segment_count = read_u32_le(contents + offset);
     offset += 4;
+    loaded_tensor_count = read_u32_le(contents + offset);
+    offset += 4;
+    loaded_dependency_ref_count = read_u32_le(contents + offset);
+    offset += 4;
+    loaded_tensor_ref_count = read_u32_le(contents + offset);
+    offset += 4;
     loaded_memory_bytes = read_u64_le(contents + offset);
     offset += 8;
     loaded_arena_bytes = read_u64_le(contents + offset);
@@ -959,26 +1049,64 @@ static int load_binary_rank_plan(cairn_context_t *ctx, const unsigned char *cont
     if (loaded_microbatch_size == 0) {
         return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan microbatch_size is invalid");
     }
-    if (loaded_op_count == 0 || loaded_segment_count == 0 || loaded_arena_bytes == 0) {
-        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan has empty op or memory tables");
+    if (loaded_op_count == 0 || loaded_segment_count == 0 || loaded_tensor_count == 0 || loaded_arena_bytes == 0) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan has empty op, tensor, or memory tables");
     }
     expected_size = CAIRN_BINARY_PLAN_HEADER_SIZE + ((size_t)loaded_segment_count * CAIRN_BINARY_PLAN_SEGMENT_SIZE);
+    if ((size_t)loaded_tensor_count > (((size_t)-1) - expected_size) / CAIRN_BINARY_PLAN_TENSOR_SIZE) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan tensor table is too large");
+    }
+    expected_size += (size_t)loaded_tensor_count * CAIRN_BINARY_PLAN_TENSOR_SIZE;
     if ((size_t)loaded_op_count > (((size_t)-1) - expected_size) / CAIRN_BINARY_PLAN_OP_SIZE) {
         return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan op table is too large");
     }
     expected_size += (size_t)loaded_op_count * CAIRN_BINARY_PLAN_OP_SIZE;
+    if ((size_t)loaded_dependency_ref_count > (((size_t)-1) - expected_size) / CAIRN_BINARY_PLAN_REF_SIZE) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan dependency table is too large");
+    }
+    expected_size += (size_t)loaded_dependency_ref_count * CAIRN_BINARY_PLAN_REF_SIZE;
+    if ((size_t)loaded_tensor_ref_count > (((size_t)-1) - expected_size) / CAIRN_BINARY_PLAN_REF_SIZE) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan tensor reference table is too large");
+    }
+    expected_size += (size_t)loaded_tensor_ref_count * CAIRN_BINARY_PLAN_REF_SIZE;
     if (contents_size != expected_size) {
         return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan size does not match header");
     }
 
+    loaded_ops = NULL;
+    loaded_segments = NULL;
+    loaded_tensors = NULL;
+    loaded_dependency_refs = NULL;
+    loaded_tensor_refs = NULL;
     loaded_segments = (cairn_memory_segment_t *)calloc((size_t)loaded_segment_count, sizeof(cairn_memory_segment_t));
     if (loaded_segments == NULL) {
         return set_error(ctx, CAIRN_ERR_STATE, "binary rank plan memory segments could not be allocated");
     }
+    loaded_tensors = (cairn_tensor_t *)calloc((size_t)loaded_tensor_count, sizeof(cairn_tensor_t));
+    if (loaded_tensors == NULL) {
+        free(loaded_segments);
+        return set_error(ctx, CAIRN_ERR_STATE, "binary rank plan tensor table could not be allocated");
+    }
     loaded_ops = (cairn_plan_op_t *)calloc((size_t)loaded_op_count, sizeof(cairn_plan_op_t));
     if (loaded_ops == NULL) {
+        free(loaded_tensors);
         free(loaded_segments);
         return set_error(ctx, CAIRN_ERR_STATE, "binary rank plan op table could not be allocated");
+    }
+    loaded_dependency_refs = (uint32_t *)calloc((size_t)loaded_dependency_ref_count, sizeof(uint32_t));
+    if (loaded_dependency_ref_count > 0 && loaded_dependency_refs == NULL) {
+        free(loaded_ops);
+        free(loaded_tensors);
+        free(loaded_segments);
+        return set_error(ctx, CAIRN_ERR_STATE, "binary rank plan dependency table could not be allocated");
+    }
+    loaded_tensor_refs = (uint32_t *)calloc((size_t)loaded_tensor_ref_count, sizeof(uint32_t));
+    if (loaded_tensor_ref_count > 0 && loaded_tensor_refs == NULL) {
+        free(loaded_dependency_refs);
+        free(loaded_ops);
+        free(loaded_tensors);
+        free(loaded_segments);
+        return set_error(ctx, CAIRN_ERR_STATE, "binary rank plan tensor reference table could not be allocated");
     }
 
     previous_end = 0;
@@ -987,7 +1115,7 @@ static int load_binary_rank_plan(cairn_context_t *ctx, const unsigned char *cont
         uint64_t segment_end;
 
         if (!copy_fixed_ascii(loaded_segments[index].name, sizeof(loaded_segments[index].name), contents + offset, 64)) {
-            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan memory segment name is invalid");
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan memory segment name is invalid");
         }
         offset += 64;
         loaded_segments[index].offset = read_u64_le(contents + offset);
@@ -995,13 +1123,13 @@ static int load_binary_rank_plan(cairn_context_t *ctx, const unsigned char *cont
         loaded_segments[index].nbytes = read_u64_le(contents + offset);
         offset += 8;
         if (loaded_segments[index].nbytes == 0) {
-            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan memory segment has zero size");
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan memory segment has zero size");
         }
         if (loaded_segments[index].offset < previous_end) {
-            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan memory segments overlap");
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan memory segments overlap");
         }
         if (UINT64_MAX - loaded_segments[index].offset < loaded_segments[index].nbytes) {
-            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan memory segment overflows");
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan memory segment overflows");
         }
         segment_end = loaded_segments[index].offset + loaded_segments[index].nbytes;
         previous_end = segment_end;
@@ -1010,7 +1138,46 @@ static int load_binary_rank_plan(cairn_context_t *ctx, const unsigned char *cont
         }
     }
     if (computed_arena_bytes != loaded_arena_bytes) {
-        return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan arena size does not match segments");
+        return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan arena size does not match segments");
+    }
+
+    for (index = 0; index < loaded_tensor_count; index++) {
+        uint32_t dim_index;
+
+        loaded_tensors[index].tensor_id = read_u32_le(contents + offset);
+        offset += 4;
+        loaded_tensors[index].dtype_id = read_u32_le(contents + offset);
+        offset += 4;
+        if (loaded_tensors[index].tensor_id != index) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan tensor ids are not contiguous");
+        }
+        if (!dtype_id_is_valid(loaded_tensors[index].dtype_id)) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan tensor dtype is invalid");
+        }
+        if (!copy_fixed_ascii(loaded_tensors[index].name, sizeof(loaded_tensors[index].name), contents + offset, 64)) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan tensor name is invalid");
+        }
+        offset += 64;
+        if (!copy_fixed_ascii(loaded_tensors[index].segment, sizeof(loaded_tensors[index].segment), contents + offset, 64)) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan tensor segment is invalid");
+        }
+        offset += 64;
+        loaded_tensors[index].offset = read_u64_le(contents + offset);
+        offset += 8;
+        loaded_tensors[index].nbytes = read_u64_le(contents + offset);
+        offset += 8;
+        loaded_tensors[index].shape_rank = read_u32_le(contents + offset);
+        offset += 4;
+        if (loaded_tensors[index].shape_rank > 4) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan tensor shape rank is invalid");
+        }
+        for (dim_index = 0; dim_index < 4; dim_index++) {
+            loaded_tensors[index].shape[dim_index] = read_u64_le(contents + offset);
+            offset += 8;
+        }
+        if (!tensor_fits_segment(&loaded_tensors[index], loaded_segments, loaded_segment_count)) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan tensor does not fit its memory segment");
+        }
     }
 
     for (index = 0; index < loaded_op_count; index++) {
@@ -1023,36 +1190,101 @@ static int load_binary_rank_plan(cairn_context_t *ctx, const unsigned char *cont
         loaded_class = read_u32_le(contents + offset);
         offset += 4;
         if (loaded_op_id != index) {
-            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op ids are not contiguous");
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan op ids are not contiguous");
         }
         if (loaded_class > (uint32_t)CAIRN_OP_CLASS_IO) {
-            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op class is invalid");
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan op class is invalid");
         }
         loaded_ops[index].op_id = loaded_op_id;
         loaded_ops[index].op_class = (cairn_op_class_t)loaded_class;
         if (!copy_fixed_ascii(loaded_ops[index].kind, sizeof(loaded_ops[index].kind), contents + offset, 48)) {
-            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op kind is invalid");
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan op kind is invalid");
         }
         offset += 48;
         if (!copy_fixed_ascii(loaded_ops[index].stream, sizeof(loaded_ops[index].stream), contents + offset, 32)) {
-            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op stream is invalid");
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan op stream is invalid");
         }
         offset += 32;
         loaded_ops[index].bytes = read_u64_le(contents + offset);
         offset += 8;
+        loaded_ops[index].tick = read_u32_le(contents + offset);
+        offset += 4;
+        loaded_ops[index].dep_first = read_u32_le(contents + offset);
+        offset += 4;
+        loaded_ops[index].dep_count = read_u32_le(contents + offset);
+        offset += 4;
+        loaded_ops[index].input_first = read_u32_le(contents + offset);
+        offset += 4;
+        loaded_ops[index].input_count = read_u32_le(contents + offset);
+        offset += 4;
+        loaded_ops[index].output_first = read_u32_le(contents + offset);
+        offset += 4;
+        loaded_ops[index].output_count = read_u32_le(contents + offset);
+        offset += 4;
 
         if (!lookup_executor(loaded_ops[index].kind, &registry_class)) {
-            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op table contains unsupported op kind");
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan op table contains unsupported op kind");
         }
         if (registry_class != loaded_ops[index].op_class) {
-            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op class does not match registry");
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan op class does not match registry");
         }
         if (!stream_matches_class(loaded_ops[index].stream, loaded_ops[index].op_class)) {
-            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op stream does not match op class");
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan op stream does not match op class");
+        }
+        if (index > 0 && loaded_ops[index].tick < loaded_ops[index - 1].tick) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan op ticks are not monotonic");
+        }
+        if (loaded_ops[index].dep_first > loaded_dependency_ref_count
+            || loaded_ops[index].dep_count > loaded_dependency_ref_count - loaded_ops[index].dep_first) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan op dependency range is invalid");
+        }
+        if (loaded_ops[index].input_first > loaded_tensor_ref_count
+            || loaded_ops[index].input_count > loaded_tensor_ref_count - loaded_ops[index].input_first) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan op input tensor range is invalid");
+        }
+        if (loaded_ops[index].output_first > loaded_tensor_ref_count
+            || loaded_ops[index].output_count > loaded_tensor_ref_count - loaded_ops[index].output_first) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan op output tensor range is invalid");
+        }
+        if (loaded_ops[index].input_count == 0) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan op has no input tensors");
+        }
+        if (loaded_ops[index].op_class != CAIRN_OP_CLASS_IO && loaded_ops[index].output_count == 0) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan non-io op has no output tensors");
+        }
+    }
+
+    for (index = 0; index < loaded_dependency_ref_count; index++) {
+        loaded_dependency_refs[index] = read_u32_le(contents + offset);
+        offset += 4;
+        if (loaded_dependency_refs[index] >= loaded_op_count) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan dependency references invalid op");
+        }
+    }
+    for (index = 0; index < loaded_op_count; index++) {
+        uint32_t dep_index;
+        for (dep_index = 0; dep_index < loaded_ops[index].dep_count; dep_index++) {
+            uint32_t dep = loaded_dependency_refs[loaded_ops[index].dep_first + dep_index];
+            if (dep >= index) {
+                return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan dependencies are not acyclic");
+            }
+        }
+        if (index == 0 && loaded_ops[index].dep_count != 0) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan first op must not have dependencies");
+        }
+        if (index > 0 && loaded_ops[index].dep_count == 0) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan non-first op has no dependencies");
+        }
+    }
+    for (index = 0; index < loaded_tensor_ref_count; index++) {
+        loaded_tensor_refs[index] = read_u32_le(contents + offset);
+        offset += 4;
+        if (loaded_tensor_refs[index] >= loaded_tensor_count) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan tensor reference is invalid");
         }
     }
     if (offset != contents_size) {
-        return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan trailing bytes are invalid");
+        return fail_binary_plan(ctx, loaded_ops, loaded_segments, loaded_tensors, loaded_dependency_refs, loaded_tensor_refs, "binary rank plan trailing bytes are invalid");
     }
 
     clear_plan(ctx);
@@ -1065,6 +1297,12 @@ static int load_binary_rank_plan(cairn_context_t *ctx, const unsigned char *cont
     ctx->op_count = loaded_op_count;
     ctx->segments = loaded_segments;
     ctx->segment_count = loaded_segment_count;
+    ctx->tensors = loaded_tensors;
+    ctx->tensor_count = loaded_tensor_count;
+    ctx->dependency_refs = loaded_dependency_refs;
+    ctx->dependency_ref_count = loaded_dependency_ref_count;
+    ctx->tensor_refs = loaded_tensor_refs;
+    ctx->tensor_ref_count = loaded_tensor_ref_count;
     if (!reserve_arena(ctx, loaded_arena_bytes)) {
         clear_plan(ctx);
         return set_error(ctx, CAIRN_ERR_STATE, "memory arena could not be reserved");
@@ -1099,7 +1337,13 @@ int cairn_init(cairn_context_t **ctx, const cairn_init_desc_t *desc) {
     created->plan_microbatch_size = 1;
     created->ops = NULL;
     created->segments = NULL;
+    created->tensors = NULL;
+    created->dependency_refs = NULL;
+    created->tensor_refs = NULL;
     created->segment_count = 0;
+    created->tensor_count = 0;
+    created->dependency_ref_count = 0;
+    created->tensor_ref_count = 0;
     created->arena_bytes = 0;
     created->arena = NULL;
     created->arena_allocated = 0;
@@ -1504,6 +1748,12 @@ int cairn_finalize(cairn_context_t *ctx) {
     ctx->ops = NULL;
     free(ctx->segments);
     ctx->segments = NULL;
+    free(ctx->tensors);
+    ctx->tensors = NULL;
+    free(ctx->dependency_refs);
+    ctx->dependency_refs = NULL;
+    free(ctx->tensor_refs);
+    ctx->tensor_refs = NULL;
     free(ctx->arena);
     ctx->arena = NULL;
     free(ctx);
@@ -1543,6 +1793,27 @@ uint64_t cairn_memory_segment_count(const cairn_context_t *ctx) {
         return 0;
     }
     return ctx->segment_count;
+}
+
+uint64_t cairn_plan_tensor_count(const cairn_context_t *ctx) {
+    if (ctx == NULL) {
+        return 0;
+    }
+    return ctx->tensor_count;
+}
+
+uint64_t cairn_plan_dependency_ref_count(const cairn_context_t *ctx) {
+    if (ctx == NULL) {
+        return 0;
+    }
+    return ctx->dependency_ref_count;
+}
+
+uint64_t cairn_plan_tensor_ref_count(const cairn_context_t *ctx) {
+    if (ctx == NULL) {
+        return 0;
+    }
+    return ctx->tensor_ref_count;
 }
 
 uint64_t cairn_memory_arena_bytes(const cairn_context_t *ctx) {

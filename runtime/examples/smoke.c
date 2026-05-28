@@ -21,6 +21,9 @@ int main(int argc, char **argv) {
     unsigned long long op_count;
     unsigned long long memory_bytes;
     unsigned long long segment_count;
+    unsigned long long tensor_count;
+    unsigned long long dependency_count;
+    unsigned long long tensor_ref_count;
     unsigned long long arena_bytes;
 
     if (argc != 4) {
@@ -62,6 +65,12 @@ int main(int argc, char **argv) {
         cairn_finalize(ctx);
         return 1;
     }
+    if (strstr(argv[1], ".cairn") != NULL
+        && (cairn_plan_tensor_count(ctx) == 0 || cairn_plan_dependency_ref_count(ctx) == 0 || cairn_plan_tensor_ref_count(ctx) == 0)) {
+        fprintf(stderr, "binary rank plan has no tensor or dependency metadata\n");
+        cairn_finalize(ctx);
+        return 1;
+    }
     if (expect_ok(cairn_next_batch(ctx, &batch), "cairn_next_batch", ctx)) {
         cairn_finalize(ctx);
         return 1;
@@ -97,6 +106,9 @@ int main(int argc, char **argv) {
     op_count = (unsigned long long)cairn_plan_op_count(ctx);
     memory_bytes = (unsigned long long)cairn_plan_memory_bytes(ctx);
     segment_count = (unsigned long long)cairn_memory_segment_count(ctx);
+    tensor_count = (unsigned long long)cairn_plan_tensor_count(ctx);
+    dependency_count = (unsigned long long)cairn_plan_dependency_ref_count(ctx);
+    tensor_ref_count = (unsigned long long)cairn_plan_tensor_ref_count(ctx);
     arena_bytes = (unsigned long long)cairn_memory_arena_bytes(ctx);
     if (expect_ok(cairn_finalize(ctx), "cairn_finalize", ctx)) {
         return 1;
@@ -122,11 +134,14 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("cairn runtime smoke ok plan=%s ops=%llu memory=%llu segments=%llu arena=%llu\n",
+    printf("cairn runtime smoke ok plan=%s ops=%llu memory=%llu segments=%llu tensors=%llu deps=%llu tensor_refs=%llu arena=%llu\n",
            plan_id,
            op_count,
            memory_bytes,
            segment_count,
+           tensor_count,
+           dependency_count,
+           tensor_ref_count,
            arena_bytes);
     return 0;
 }

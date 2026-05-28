@@ -12,7 +12,9 @@ from cairn.compiler import (
     BINARY_PLAN_HEADER,
     BINARY_PLAN_MAGIC,
     BINARY_PLAN_OP,
+    BINARY_PLAN_REF,
     BINARY_PLAN_SEGMENT,
+    BINARY_PLAN_TENSOR,
     BINARY_PLAN_VERSION,
     compile_plan,
 )
@@ -143,6 +145,9 @@ class CompileTests(unittest.TestCase):
                 microbatch_size,
                 op_count,
                 segment_count,
+                tensor_count,
+                dependency_count,
+                tensor_ref_count,
                 estimated_memory_bytes,
                 arena_bytes,
             ) = binary_header
@@ -156,13 +161,25 @@ class CompileTests(unittest.TestCase):
             self.assertEqual(microbatch_size, rank_plan["microbatch_size"])
             self.assertEqual(op_count, len(rank_plan["ops"]))
             self.assertEqual(segment_count, len(rank_plan["memory"]["segments"]))
+            self.assertEqual(tensor_count, len(rank_plan["tensors"]))
+            self.assertEqual(dependency_count, sum(len(op["deps"]) for op in rank_plan["ops"]))
+            self.assertEqual(
+                tensor_ref_count,
+                sum(len(op["input_tensors"]) + len(op["output_tensors"]) for op in rank_plan["ops"]),
+            )
             self.assertEqual(estimated_memory_bytes, rank_plan["memory"]["estimated_bytes_per_rank"])
             self.assertGreaterEqual(arena_bytes, estimated_memory_bytes)
+            self.assertEqual(rank_plan["ops"][0]["deps"], [])
+            self.assertTrue(all(op["tick"] == op["op_id"] for op in rank_plan["ops"]))
+            self.assertTrue(all(op["input_tensors"] for op in rank_plan["ops"]))
+            self.assertTrue(all(op["output_tensors"] for op in rank_plan["ops"] if op["op_class"] != "io"))
             self.assertEqual(
                 binary_plan.stat().st_size,
                 BINARY_PLAN_HEADER.size
                 + (segment_count * BINARY_PLAN_SEGMENT.size)
-                + (op_count * BINARY_PLAN_OP.size),
+                + (tensor_count * BINARY_PLAN_TENSOR.size)
+                + (op_count * BINARY_PLAN_OP.size)
+                + ((dependency_count + tensor_ref_count) * BINARY_PLAN_REF.size),
             )
 
     def test_simulator_reports_pipeline_and_failure(self) -> None:
@@ -178,6 +195,8 @@ class CompileTests(unittest.TestCase):
             report = simulate_plan(Path(out), failure="rank:3")
             self.assertEqual(report["world_size"], 8)
             self.assertGreater(report["pipeline_bubble_ratio"], 0)
+            self.assertEqual(report["tensor_count_by_rank"]["0"], 8)
+            self.assertEqual(report["dependency_count_by_rank"]["0"], 16)
             self.assertEqual(report["failure_injection"]["status"], "restart_required")
 
 

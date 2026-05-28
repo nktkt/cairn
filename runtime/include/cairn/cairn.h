@@ -58,6 +58,9 @@ const char *cairn_plan_id(const cairn_context_t *ctx);
 uint64_t cairn_plan_op_count(const cairn_context_t *ctx);
 uint64_t cairn_plan_memory_bytes(const cairn_context_t *ctx);
 uint64_t cairn_memory_segment_count(const cairn_context_t *ctx);
+uint64_t cairn_plan_tensor_count(const cairn_context_t *ctx);
+uint64_t cairn_plan_dependency_ref_count(const cairn_context_t *ctx);
+uint64_t cairn_plan_tensor_ref_count(const cairn_context_t *ctx);
 uint64_t cairn_memory_arena_bytes(const cairn_context_t *ctx);
 uint64_t cairn_current_step(const cairn_context_t *ctx);
 

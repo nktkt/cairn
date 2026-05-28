@@ -7,7 +7,7 @@ import unittest
 import json
 from pathlib import Path
 
-from cairn.compiler import compile_plan
+from cairn.compiler import BINARY_PLAN_HEADER, BINARY_PLAN_OP, BINARY_PLAN_SEGMENT, BINARY_PLAN_TENSOR, compile_plan
 from cairn.jsonutil import load_json
 
 
@@ -90,6 +90,9 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertIn("cairn runtime smoke ok", run_result.stdout)
             self.assertIn("ops=17", run_result.stdout)
             self.assertIn("segments=7", run_result.stdout)
+            self.assertIn("tensors=8", run_result.stdout)
+            self.assertIn("deps=16", run_result.stdout)
+            self.assertIn("tensor_refs=", run_result.stdout)
             self.assertTrue((checkpoint / "latest.json").exists())
             latest_data = load_json(checkpoint / "latest.json")
             self.assertTrue(latest_data["complete"])
@@ -104,6 +107,9 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(checkpoint_data["step"], 1)
             self.assertEqual(checkpoint_data["ops_executed"], 17)
             self.assertEqual(checkpoint_data["memory_segment_count"], 7)
+            self.assertEqual(checkpoint_data["tensor_count"], 8)
+            self.assertEqual(checkpoint_data["dependency_ref_count"], 16)
+            self.assertGreater(checkpoint_data["tensor_ref_count"], 0)
             self.assertGreaterEqual(checkpoint_data["arena_bytes"], checkpoint_data["estimated_memory_bytes"])
             self.assertGreater(checkpoint_data["compute_ops"], 0)
             self.assertGreater(checkpoint_data["communication_ops"], 0)
@@ -243,6 +249,32 @@ class RuntimeSmokeTests(unittest.TestCase):
             )
             self.assertNotEqual(bad_binary_registry_result.returncode, 0)
             self.assertIn("op registry hash", bad_binary_registry_result.stderr)
+
+            bad_binary_dep = temp_path / "bad-dependency-plan.cairn"
+            bad_binary_dep_data = bytearray(binary_plan.read_bytes())
+            binary_header = BINARY_PLAN_HEADER.unpack(bad_binary_dep_data[: BINARY_PLAN_HEADER.size])
+            op_count = binary_header[8]
+            segment_count = binary_header[9]
+            tensor_count = binary_header[10]
+            dependency_count = binary_header[11]
+            self.assertEqual(dependency_count, 16)
+            dep_table_offset = (
+                BINARY_PLAN_HEADER.size
+                + (segment_count * BINARY_PLAN_SEGMENT.size)
+                + (tensor_count * BINARY_PLAN_TENSOR.size)
+                + (op_count * BINARY_PLAN_OP.size)
+            )
+            bad_binary_dep_data[dep_table_offset : dep_table_offset + 4] = (1).to_bytes(4, "little")
+            bad_binary_dep.write_bytes(bad_binary_dep_data)
+            bad_binary_dep_result = subprocess.run(
+                [str(binary), str(bad_binary_dep), "8", str(temp_path / "bad-binary-dependency-checkpoint")],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(bad_binary_dep_result.returncode, 0)
+            self.assertIn("dependencies", bad_binary_dep_result.stderr)
 
 
 if __name__ == "__main__":
