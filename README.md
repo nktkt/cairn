@@ -38,7 +38,7 @@ The current implementation includes:
 - `cairn compile` for deterministic static plan generation
 - `cairn simulate` for pipeline, memory, communication, checkpoint, and failure-injection reports
 - `cairn report` for compact report summaries
-- a C ABI/runtime dry-run skeleton that loads rank plans, validates memory segments, reserves arena metadata, executes op tables, records stats, and writes checkpoint manifests
+- a C ABI/runtime dry-run skeleton that loads rank plans, validates memory segments, reserves arena metadata, rejects unsupported op kinds, executes op tables, records stats, and writes checkpoint manifests
 - small example specs under [examples/small](examples/small)
 - unit tests and GitHub Actions CI
 

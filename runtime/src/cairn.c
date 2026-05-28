@@ -5,9 +5,16 @@
 #include <string.h>
 #include <ctype.h>
 
+typedef enum {
+    CAIRN_OP_CLASS_COMPUTE = 0,
+    CAIRN_OP_CLASS_COMMUNICATION = 1,
+    CAIRN_OP_CLASS_IO = 2
+} cairn_op_class_t;
+
 typedef struct {
     uint64_t op_id;
     uint64_t bytes;
+    cairn_op_class_t op_class;
     char kind[48];
     char stream[32];
 } cairn_plan_op_t;
@@ -39,6 +46,26 @@ struct cairn_context {
     int plan_loaded;
     int checkpoint_loaded;
     int finalized;
+};
+
+typedef struct {
+    const char *kind;
+    cairn_op_class_t op_class;
+} cairn_executor_desc_t;
+
+static const cairn_executor_desc_t CAIRN_EXECUTORS[] = {
+    {"rmsnorm", CAIRN_OP_CLASS_COMPUTE},
+    {"attention_fwd", CAIRN_OP_CLASS_COMPUTE},
+    {"attention_bwd", CAIRN_OP_CLASS_COMPUTE},
+    {"mlp_fwd", CAIRN_OP_CLASS_COMPUTE},
+    {"mlp_bwd", CAIRN_OP_CLASS_COMPUTE},
+    {"optimizer", CAIRN_OP_CLASS_COMPUTE},
+    {"all_reduce", CAIRN_OP_CLASS_COMMUNICATION},
+    {"reduce_scatter", CAIRN_OP_CLASS_COMMUNICATION},
+    {"all_gather", CAIRN_OP_CLASS_COMMUNICATION},
+    {"pipe_send_activation", CAIRN_OP_CLASS_COMMUNICATION},
+    {"pipe_recv_activation_grad", CAIRN_OP_CLASS_COMMUNICATION},
+    {"checkpoint_stage", CAIRN_OP_CLASS_IO}
 };
 
 static int set_error(cairn_context_t *ctx, int code, const char *message) {
@@ -202,6 +229,43 @@ static uint64_t count_occurrences_range(const char *text, const char *end, const
         cursor += needle_len;
     }
     return count;
+}
+
+static int stream_is_comm(const char *stream) {
+    return stream != NULL && strncmp(stream, "comm_", 5) == 0;
+}
+
+static int stream_is_io(const char *stream) {
+    return stream != NULL && strcmp(stream, "io") == 0;
+}
+
+static int stream_is_compute(const char *stream) {
+    return stream != NULL && strncmp(stream, "compute_", 8) == 0;
+}
+
+static int lookup_executor(const char *kind, cairn_op_class_t *out_class) {
+    size_t index;
+
+    if (kind == NULL || out_class == NULL) {
+        return 0;
+    }
+    for (index = 0; index < sizeof(CAIRN_EXECUTORS) / sizeof(CAIRN_EXECUTORS[0]); index++) {
+        if (strcmp(kind, CAIRN_EXECUTORS[index].kind) == 0) {
+            *out_class = CAIRN_EXECUTORS[index].op_class;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int stream_matches_class(const char *stream, cairn_op_class_t op_class) {
+    if (op_class == CAIRN_OP_CLASS_IO) {
+        return stream_is_io(stream);
+    }
+    if (op_class == CAIRN_OP_CLASS_COMMUNICATION) {
+        return stream_is_comm(stream);
+    }
+    return stream_is_compute(stream);
 }
 
 static const char *find_matching_bracket(const char *open) {
@@ -379,7 +443,17 @@ static int parse_op_table(const char *json, cairn_plan_op_t **out_ops, uint64_t 
             free(ops);
             return 0;
         }
+        if (!lookup_executor(ops[index].kind, &ops[index].op_class)) {
+            free(object_json);
+            free(ops);
+            return 0;
+        }
         if (!parse_json_string(object_json, "stream", ops[index].stream, sizeof(ops[index].stream))) {
+            free(object_json);
+            free(ops);
+            return 0;
+        }
+        if (!stream_matches_class(ops[index].stream, ops[index].op_class)) {
             free(object_json);
             free(ops);
             return 0;
@@ -538,14 +612,6 @@ static int reserve_arena(cairn_context_t *ctx, uint64_t arena_bytes) {
     }
     ctx->arena_bytes = arena_bytes;
     return 1;
-}
-
-static int stream_is_comm(const char *stream) {
-    return stream != NULL && strncmp(stream, "comm_", 5) == 0;
-}
-
-static int stream_is_io(const char *stream) {
-    return stream != NULL && strcmp(stream, "io") == 0;
 }
 
 static void clear_plan(cairn_context_t *ctx) {
@@ -794,10 +860,10 @@ int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch) {
         const cairn_plan_op_t *op = &ctx->ops[index];
 
         ctx->stats.ops_executed += 1;
-        if (stream_is_io(op->stream)) {
+        if (op->op_class == CAIRN_OP_CLASS_IO) {
             ctx->stats.io_ops += 1;
             ctx->stats.io_bytes += op->bytes;
-        } else if (stream_is_comm(op->stream)) {
+        } else if (op->op_class == CAIRN_OP_CLASS_COMMUNICATION) {
             ctx->stats.communication_ops += 1;
             ctx->stats.communication_bytes += op->bytes;
         } else {
@@ -855,6 +921,10 @@ int cairn_save_checkpoint(cairn_context_t *ctx, const char *tag) {
     fprintf(file, "  \"arena_bytes\": %llu,\n", (unsigned long long)ctx->arena_bytes);
     fprintf(file, "  \"arena_allocated\": %s,\n", ctx->arena_allocated ? "true" : "false");
     fprintf(file, "  \"ops_executed\": %llu,\n", (unsigned long long)ctx->stats.ops_executed);
+    fprintf(file, "  \"compute_ops\": %llu,\n", (unsigned long long)ctx->stats.compute_ops);
+    fprintf(file, "  \"communication_ops\": %llu,\n", (unsigned long long)ctx->stats.communication_ops);
+    fprintf(file, "  \"io_ops\": %llu,\n", (unsigned long long)ctx->stats.io_ops);
+    fprintf(file, "  \"compute_bytes\": %llu,\n", (unsigned long long)ctx->stats.compute_bytes);
     fprintf(file, "  \"communication_bytes\": %llu,\n", (unsigned long long)ctx->stats.communication_bytes);
     fprintf(file, "  \"io_bytes\": %llu\n", (unsigned long long)ctx->stats.io_bytes);
     fprintf(file, "}\n");

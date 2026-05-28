@@ -73,6 +73,10 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(checkpoint_data["ops_executed"], 17)
             self.assertEqual(checkpoint_data["memory_segment_count"], 7)
             self.assertGreaterEqual(checkpoint_data["arena_bytes"], checkpoint_data["estimated_memory_bytes"])
+            self.assertGreater(checkpoint_data["compute_ops"], 0)
+            self.assertGreater(checkpoint_data["communication_ops"], 0)
+            self.assertGreater(checkpoint_data["io_ops"], 0)
+            self.assertGreater(checkpoint_data["compute_bytes"], 0)
             self.assertGreater(checkpoint_data["communication_bytes"], 0)
             self.assertGreater(checkpoint_data["io_bytes"], 0)
 
@@ -99,6 +103,34 @@ class RuntimeSmokeTests(unittest.TestCase):
             )
             self.assertNotEqual(bad_memory_result.returncode, 0)
             self.assertIn("memory segments", bad_memory_result.stderr)
+
+            bad_kind = temp_path / "bad-kind-plan.json"
+            bad_kind_data = load_json(plan_dir / "ranks" / "rank_000000.json")
+            bad_kind_data["ops"][0]["kind"] = "unknown_kernel"
+            bad_kind.write_text(json.dumps(bad_kind_data, indent=2, sort_keys=True), encoding="utf-8")
+            bad_kind_result = subprocess.run(
+                [str(binary), str(bad_kind), "8", str(temp_path / "bad-kind-checkpoint.json")],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(bad_kind_result.returncode, 0)
+            self.assertIn("op table", bad_kind_result.stderr)
+
+            bad_stream = temp_path / "bad-stream-plan.json"
+            bad_stream_data = load_json(plan_dir / "ranks" / "rank_000000.json")
+            bad_stream_data["ops"][0]["stream"] = "comm_dp"
+            bad_stream.write_text(json.dumps(bad_stream_data, indent=2, sort_keys=True), encoding="utf-8")
+            bad_stream_result = subprocess.run(
+                [str(binary), str(bad_stream), "8", str(temp_path / "bad-stream-checkpoint.json")],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(bad_stream_result.returncode, 0)
+            self.assertIn("op table", bad_stream_result.stderr)
 
 
 if __name__ == "__main__":
