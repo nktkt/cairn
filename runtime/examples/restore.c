@@ -10,10 +10,19 @@ static int expect_ok(int status, const char *label, cairn_context_t *ctx) {
     return 0;
 }
 
+static unsigned int read_u32_le(const unsigned char *bytes) {
+    return ((unsigned int)bytes[0])
+         | ((unsigned int)bytes[1] << 8)
+         | ((unsigned int)bytes[2] << 16)
+         | ((unsigned int)bytes[3] << 24);
+}
+
 int main(int argc, char **argv) {
     cairn_context_t *ctx = NULL;
     cairn_init_desc_t desc;
     cairn_batch_t batch;
+    unsigned char token_buffer[16];
+    uint64_t tokens_read;
     unsigned int world_size;
 
     if (argc != 4 && argc != 5) {
@@ -56,6 +65,18 @@ int main(int argc, char **argv) {
         }
         if (batch.shard_path[0] == '\0' || batch.shard_index != 0 || batch.shard_token_offset != 2) {
             fprintf(stderr, "checkpoint restore did not recover dataset cursor\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (expect_ok(
+                cairn_read_batch_tokens(ctx, &batch, token_buffer, 4, sizeof(token_buffer), &tokens_read),
+                "cairn_read_batch_tokens",
+                ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (tokens_read != 4 || read_u32_le(token_buffer) != 2 || read_u32_le(token_buffer + 12) != 5) {
+            fprintf(stderr, "checkpoint restore did not recover readable dataset token bytes\n");
             cairn_finalize(ctx);
             return 1;
         }

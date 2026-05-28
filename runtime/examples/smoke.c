@@ -11,9 +11,17 @@ static int expect_ok(int status, const char *label, cairn_context_t *ctx) {
     return 0;
 }
 
+static unsigned int read_u32_le(const unsigned char *bytes) {
+    return ((unsigned int)bytes[0])
+         | ((unsigned int)bytes[1] << 8)
+         | ((unsigned int)bytes[2] << 16)
+         | ((unsigned int)bytes[3] << 24);
+}
+
 int main(int argc, char **argv) {
     cairn_context_t *ctx = NULL;
     cairn_batch_t batch;
+    cairn_batch_t wrap_batch;
     cairn_runtime_stats_t stats;
     cairn_trace_event_t first_trace;
     cairn_trace_event_t last_trace;
@@ -29,6 +37,9 @@ int main(int argc, char **argv) {
     unsigned long long dataset_shard_count;
     unsigned long long dataset_total_tokens;
     unsigned long long arena_bytes;
+    unsigned char token_buffer[40];
+    uint64_t tokens_read;
+    int status;
 
     if (argc < 4 || argc > 6) {
         fprintf(stderr, "usage: %s RANK_PLAN WORLD_SIZE CHECKPOINT_OUT [TRACE_OUT] [DATASET_MANIFEST]\n", argv[0]);
@@ -91,6 +102,38 @@ int main(int argc, char **argv) {
         }
         if (batch.shard_path[0] == '\0' || batch.tokens_available == 0) {
             fprintf(stderr, "dataset batch cursor was not populated\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (expect_ok(
+                cairn_read_batch_tokens(ctx, &batch, token_buffer, 10, sizeof(token_buffer), &tokens_read),
+                "cairn_read_batch_tokens",
+                ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (tokens_read != 10 || read_u32_le(token_buffer) != 0 || read_u32_le(token_buffer + 36) != 9) {
+            fprintf(stderr, "dataset batch token bytes were not read correctly\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
+        status = cairn_read_batch_tokens(ctx, &batch, token_buffer, 10, 4, &tokens_read);
+        if (status == CAIRN_OK) {
+            fprintf(stderr, "dataset batch token reader accepted an undersized buffer\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
+        wrap_batch = batch;
+        wrap_batch.token_offset = UINT64_MAX - 1;
+        if (expect_ok(
+                cairn_read_batch_tokens(ctx, &wrap_batch, token_buffer, 4, sizeof(token_buffer), &tokens_read),
+                "cairn_read_batch_tokens_wrap",
+                ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (tokens_read != 4 || read_u32_le(token_buffer) != 14 || read_u32_le(token_buffer + 12) != 1) {
+            fprintf(stderr, "dataset batch token reader did not wrap a large logical offset correctly\n");
             cairn_finalize(ctx);
             return 1;
         }
@@ -173,6 +216,24 @@ int main(int argc, char **argv) {
         fprintf(stderr, "checkpoint restore did not recover step\n");
         cairn_finalize(ctx);
         return 1;
+    }
+    if (argc == 6) {
+        if (expect_ok(cairn_next_batch(ctx, &batch), "cairn_next_batch_restore", ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (expect_ok(
+                cairn_read_batch_tokens(ctx, &batch, token_buffer, 4, sizeof(token_buffer), &tokens_read),
+                "cairn_read_batch_tokens_restore",
+                ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (tokens_read != 4 || read_u32_le(token_buffer) != 2 || read_u32_le(token_buffer + 12) != 5) {
+            fprintf(stderr, "checkpoint restore did not recover readable dataset token cursor\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
     }
     if (expect_ok(cairn_finalize(ctx), "cairn_finalize_restore", ctx)) {
         return 1;

@@ -71,6 +71,14 @@ int cairn_load_plan(cairn_context_t *ctx, const char *path);
 int cairn_load_dataset(cairn_context_t *ctx, const char *path);
 int cairn_load_checkpoint(cairn_context_t *ctx, const char *path);
 int cairn_next_batch(cairn_context_t *ctx, cairn_batch_t *batch);
+int cairn_read_batch_tokens(
+    cairn_context_t *ctx,
+    const cairn_batch_t *batch,
+    void *out,
+    uint64_t token_count,
+    uint64_t out_nbytes,
+    uint64_t *out_tokens_read
+);
 int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch);
 int cairn_get_stats(const cairn_context_t *ctx, cairn_runtime_stats_t *stats);
 uint64_t cairn_trace_event_count(const cairn_context_t *ctx);

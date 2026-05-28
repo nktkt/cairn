@@ -97,6 +97,7 @@ cc -std=c11 -Wall -Wextra -Werror \
 ```
 
 The smoke binary also accepts an optional dataset manifest after `TRACE_OUT`. The manifest must use `format: fixed-token-binary`; relative shard paths are resolved from the manifest directory and checked against the declared token count and token dtype.
+When a dataset is loaded, the runtime resolves each batch to a shard cursor and `cairn_read_batch_tokens` can read token bytes across shard boundaries with wraparound.
 
 The restore smoke binary verifies that a checkpoint root can be restored through `latest.json`:
 

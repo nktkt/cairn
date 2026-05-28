@@ -2051,6 +2051,130 @@ int cairn_next_batch(cairn_context_t *ctx, cairn_batch_t *batch) {
     return CAIRN_OK;
 }
 
+static int read_tokens_from_shard(
+    const cairn_dataset_shard_t *shard,
+    uint64_t shard_token_offset,
+    uint32_t token_bytes,
+    uint64_t token_count,
+    unsigned char *out
+) {
+    FILE *file;
+    uint64_t byte_offset;
+    uint64_t nbytes;
+
+    if (shard == NULL || out == NULL || token_bytes == 0 || token_count == 0) {
+        return 0;
+    }
+    if (shard_token_offset > shard->tokens || token_count > shard->tokens - shard_token_offset) {
+        return 0;
+    }
+    if (shard_token_offset > UINT64_MAX / token_bytes || token_count > UINT64_MAX / token_bytes) {
+        return 0;
+    }
+    byte_offset = shard_token_offset * token_bytes;
+    nbytes = token_count * token_bytes;
+    if ((uint64_t)((long)byte_offset) != byte_offset || (uint64_t)((size_t)nbytes) != nbytes) {
+        return 0;
+    }
+
+    file = fopen(shard->path, "rb");
+    if (file == NULL) {
+        return 0;
+    }
+    if (fseek(file, (long)byte_offset, SEEK_SET) != 0) {
+        fclose(file);
+        return 0;
+    }
+    if (fread(out, 1, (size_t)nbytes, file) != (size_t)nbytes) {
+        fclose(file);
+        return 0;
+    }
+    fclose(file);
+    return 1;
+}
+
+int cairn_read_batch_tokens(
+    cairn_context_t *ctx,
+    const cairn_batch_t *batch,
+    void *out,
+    uint64_t token_count,
+    uint64_t out_nbytes,
+    uint64_t *out_tokens_read
+) {
+    unsigned char *cursor_out;
+    uint64_t remaining;
+    uint64_t current_token_offset;
+    uint64_t bytes_required;
+    uint64_t tokens_read;
+
+    if (out_tokens_read != NULL) {
+        *out_tokens_read = 0;
+    }
+    if (ctx == NULL || batch == NULL || out == NULL || token_count == 0) {
+        return CAIRN_ERR_INVALID_ARGUMENT;
+    }
+    if (ctx->finalized) {
+        return set_error(ctx, CAIRN_ERR_STATE, "context is finalized");
+    }
+    if (!ctx->dataset_loaded || ctx->dataset_total_tokens == 0 || ctx->dataset_shard_count == 0) {
+        return set_error(ctx, CAIRN_ERR_STATE, "dataset must be loaded before reading batch tokens");
+    }
+    if (ctx->dataset_token_bytes == 0 || token_count > UINT64_MAX / ctx->dataset_token_bytes) {
+        return set_error(ctx, CAIRN_ERR_STATE, "dataset token byte count is invalid");
+    }
+    bytes_required = token_count * ctx->dataset_token_bytes;
+    if (out_nbytes < bytes_required || (uint64_t)((size_t)bytes_required) != bytes_required) {
+        return set_error(ctx, CAIRN_ERR_INVALID_ARGUMENT, "batch token output buffer is too small");
+    }
+
+    cursor_out = (unsigned char *)out;
+    remaining = token_count;
+    current_token_offset = batch->token_offset % ctx->dataset_total_tokens;
+    tokens_read = 0;
+    while (remaining > 0) {
+        uint32_t shard_index;
+        uint64_t shard_token_offset;
+        uint64_t tokens_available;
+        uint64_t to_read;
+
+        if (!resolve_dataset_cursor(
+                ctx,
+                current_token_offset,
+                &shard_index,
+                &shard_token_offset,
+                &tokens_available,
+                NULL,
+                0)) {
+            return set_error(ctx, CAIRN_ERR_STATE, "dataset cursor could not be resolved while reading tokens");
+        }
+        if (shard_index >= ctx->dataset_shard_count || tokens_available == 0) {
+            return set_error(ctx, CAIRN_ERR_STATE, "dataset shard cursor is invalid while reading tokens");
+        }
+        to_read = remaining < tokens_available ? remaining : tokens_available;
+        if (!read_tokens_from_shard(
+                &ctx->dataset_shards[shard_index],
+                shard_token_offset,
+                ctx->dataset_token_bytes,
+                to_read,
+                cursor_out)) {
+            return set_error(ctx, CAIRN_ERR_IO, "dataset shard token bytes could not be read");
+        }
+        cursor_out += (size_t)(to_read * ctx->dataset_token_bytes);
+        remaining -= to_read;
+        tokens_read += to_read;
+        if (ctx->dataset_total_tokens - current_token_offset <= to_read) {
+            current_token_offset = to_read - (ctx->dataset_total_tokens - current_token_offset);
+        } else {
+            current_token_offset += to_read;
+        }
+    }
+
+    if (out_tokens_read != NULL) {
+        *out_tokens_read = tokens_read;
+    }
+    return CAIRN_OK;
+}
+
 static void update_stats_for_op(cairn_context_t *ctx, const cairn_plan_op_t *op) {
     ctx->stats.ops_executed += 1;
     if (op->op_class == CAIRN_OP_CLASS_IO) {
