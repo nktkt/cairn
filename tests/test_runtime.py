@@ -151,6 +151,9 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(checkpoint_data["dataset_shard_count"], 2)
             self.assertEqual(checkpoint_data["dataset_total_tokens"], 16)
             self.assertEqual(checkpoint_data["dataset_token_bytes"], 4)
+            self.assertEqual(checkpoint_data["dataset_cursor_shard_index"], 0)
+            self.assertEqual(checkpoint_data["dataset_cursor_shard_token_offset"], 2)
+            self.assertEqual(checkpoint_data["dataset_cursor_tokens_available"], 6)
             self.assertGreaterEqual(checkpoint_data["arena_bytes"], checkpoint_data["estimated_memory_bytes"])
             self.assertGreater(checkpoint_data["compute_ops"], 0)
             self.assertGreater(checkpoint_data["communication_ops"], 0)
@@ -159,7 +162,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertGreater(checkpoint_data["communication_bytes"], 0)
             self.assertGreater(checkpoint_data["io_bytes"], 0)
             restore_result = subprocess.run(
-                [str(restore_binary), str(binary_plan), "8", str(checkpoint)],
+                [str(restore_binary), str(binary_plan), "8", str(checkpoint), str(dataset_manifest)],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
@@ -167,6 +170,16 @@ class RuntimeSmokeTests(unittest.TestCase):
             )
             self.assertEqual(restore_result.returncode, 0, restore_result.stderr)
             self.assertIn("cairn restore smoke ok", restore_result.stdout)
+
+            restore_without_dataset_result = subprocess.run(
+                [str(restore_binary), str(binary_plan), "8", str(checkpoint)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(restore_without_dataset_result.returncode, 0)
+            self.assertIn("dataset", restore_without_dataset_result.stderr)
 
             incomplete_checkpoint = temp_path / "incomplete-checkpoint"
             shutil.copytree(checkpoint, incomplete_checkpoint)

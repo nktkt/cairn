@@ -977,6 +977,62 @@ static int parse_dataset_shards(
     return 1;
 }
 
+static int resolve_dataset_cursor(
+    const cairn_context_t *ctx,
+    uint64_t token_offset,
+    uint32_t *out_shard_index,
+    uint64_t *out_shard_token_offset,
+    uint64_t *out_tokens_available,
+    char *out_path,
+    size_t out_path_size
+) {
+    uint64_t cursor;
+    uint64_t shard_index;
+
+    if (out_shard_index != NULL) {
+        *out_shard_index = 0;
+    }
+    if (out_shard_token_offset != NULL) {
+        *out_shard_token_offset = token_offset;
+    }
+    if (out_tokens_available != NULL) {
+        *out_tokens_available = UINT64_MAX;
+    }
+    if (out_path != NULL && out_path_size > 0) {
+        out_path[0] = '\0';
+    }
+
+    if (ctx == NULL || !ctx->dataset_loaded) {
+        return 1;
+    }
+    if (ctx->dataset_total_tokens == 0 || ctx->dataset_shard_count == 0 || ctx->dataset_shards == NULL) {
+        return 0;
+    }
+
+    cursor = token_offset % ctx->dataset_total_tokens;
+    for (shard_index = 0; shard_index < ctx->dataset_shard_count; shard_index++) {
+        const cairn_dataset_shard_t *shard = &ctx->dataset_shards[shard_index];
+
+        if (cursor < shard->tokens) {
+            if (out_shard_index != NULL) {
+                *out_shard_index = (uint32_t)shard_index;
+            }
+            if (out_shard_token_offset != NULL) {
+                *out_shard_token_offset = cursor;
+            }
+            if (out_tokens_available != NULL) {
+                *out_tokens_available = shard->tokens - cursor;
+            }
+            if (out_path != NULL && out_path_size > 0) {
+                snprintf(out_path, out_path_size, "%s", shard->path);
+            }
+            return 1;
+        }
+        cursor -= shard->tokens;
+    }
+    return 0;
+}
+
 static int reserve_arena(cairn_context_t *ctx, uint64_t arena_bytes) {
     const char *allocate_host_arena;
 
@@ -1032,10 +1088,22 @@ static int reserve_execution_state(cairn_context_t *ctx, uint64_t op_count) {
 static int restore_checkpoint_contents(cairn_context_t *ctx, const char *contents) {
     char checkpoint_plan_id[65];
     uint64_t parsed;
+    uint64_t checkpoint_token_offset;
+    uint64_t expected_shard_offset;
+    uint64_t expected_tokens_available;
+    uint32_t expected_shard_index;
+    int checkpoint_dataset_loaded;
+    int has_checkpoint_dataset_loaded;
 
     if (ctx == NULL || contents == NULL) {
         return 0;
     }
+    checkpoint_token_offset = ctx->token_offset;
+    expected_shard_index = 0;
+    expected_shard_offset = 0;
+    expected_tokens_available = 0;
+    checkpoint_dataset_loaded = 0;
+    has_checkpoint_dataset_loaded = 0;
     if (parse_json_string(contents, "plan_id", checkpoint_plan_id, sizeof(checkpoint_plan_id))) {
         if (ctx->plan_loaded && strcmp(checkpoint_plan_id, ctx->plan_id) != 0) {
             return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint plan_id does not match loaded plan");
@@ -1046,6 +1114,43 @@ static int restore_checkpoint_contents(cairn_context_t *ctx, const char *content
     }
     if (parse_json_u64(contents, "token_offset", &parsed)) {
         ctx->token_offset = parsed;
+        checkpoint_token_offset = parsed;
+    }
+    if (parse_json_bool(contents, "dataset_loaded", &checkpoint_dataset_loaded)) {
+        has_checkpoint_dataset_loaded = 1;
+    }
+    if (has_checkpoint_dataset_loaded && checkpoint_dataset_loaded) {
+        if (!ctx->dataset_loaded) {
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint requires dataset manifest before restore");
+        }
+        if (!parse_json_u64(contents, "dataset_shard_count", &parsed) || parsed != ctx->dataset_shard_count) {
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint dataset shard count does not match loaded dataset");
+        }
+        if (!parse_json_u64(contents, "dataset_total_tokens", &parsed) || parsed != ctx->dataset_total_tokens) {
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint dataset token count does not match loaded dataset");
+        }
+        if (!parse_json_u64(contents, "dataset_token_bytes", &parsed) || parsed != ctx->dataset_token_bytes) {
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint dataset token dtype does not match loaded dataset");
+        }
+        if (!resolve_dataset_cursor(
+                ctx,
+                checkpoint_token_offset,
+                &expected_shard_index,
+                &expected_shard_offset,
+                &expected_tokens_available,
+                NULL,
+                0)) {
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint dataset cursor could not be resolved");
+        }
+        if (!parse_json_u64(contents, "dataset_cursor_shard_index", &parsed) || parsed != expected_shard_index) {
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint dataset shard cursor does not match token offset");
+        }
+        if (!parse_json_u64(contents, "dataset_cursor_shard_token_offset", &parsed) || parsed != expected_shard_offset) {
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint dataset token cursor does not match token offset");
+        }
+        if (!parse_json_u64(contents, "dataset_cursor_tokens_available", &parsed) || parsed != expected_tokens_available) {
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint dataset available token count does not match token offset");
+        }
     }
     if (parse_json_u64(contents, "ops_executed", &parsed)) {
         ctx->stats.ops_executed = parsed;
@@ -1077,9 +1182,27 @@ static int restore_checkpoint_contents(cairn_context_t *ctx, const char *content
 static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     FILE *file;
     char tmp_path[CAIRN_PATH_MAX];
+    uint32_t dataset_cursor_shard_index;
+    uint64_t dataset_cursor_shard_token_offset;
+    uint64_t dataset_cursor_tokens_available;
 
     if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) <= 0 || strlen(path) + 4 >= sizeof(tmp_path)) {
         return set_error(ctx, CAIRN_ERR_IO, "rank checkpoint temporary path is too long");
+    }
+    dataset_cursor_shard_index = 0;
+    dataset_cursor_shard_token_offset = 0;
+    dataset_cursor_tokens_available = 0;
+    if (ctx->dataset_loaded) {
+        if (!resolve_dataset_cursor(
+                ctx,
+                ctx->token_offset,
+                &dataset_cursor_shard_index,
+                &dataset_cursor_shard_token_offset,
+                &dataset_cursor_tokens_available,
+                NULL,
+                0)) {
+            return set_error(ctx, CAIRN_ERR_STATE, "dataset cursor could not be resolved for checkpoint");
+        }
     }
 
     file = fopen(tmp_path, "wb");
@@ -1103,6 +1226,9 @@ static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     fprintf(file, "  \"dataset_shard_count\": %llu,\n", (unsigned long long)ctx->dataset_shard_count);
     fprintf(file, "  \"dataset_total_tokens\": %llu,\n", (unsigned long long)ctx->dataset_total_tokens);
     fprintf(file, "  \"dataset_token_bytes\": %u,\n", ctx->dataset_token_bytes);
+    fprintf(file, "  \"dataset_cursor_shard_index\": %u,\n", dataset_cursor_shard_index);
+    fprintf(file, "  \"dataset_cursor_shard_token_offset\": %llu,\n", (unsigned long long)dataset_cursor_shard_token_offset);
+    fprintf(file, "  \"dataset_cursor_tokens_available\": %llu,\n", (unsigned long long)dataset_cursor_tokens_available);
     fprintf(file, "  \"arena_bytes\": %llu,\n", (unsigned long long)ctx->arena_bytes);
     fprintf(file, "  \"arena_allocated\": %s,\n", ctx->arena_allocated ? "true" : "false");
     fprintf(file, "  \"ops_executed\": %llu,\n", (unsigned long long)ctx->stats.ops_executed);
@@ -1825,6 +1951,12 @@ int cairn_load_checkpoint(cairn_context_t *ctx, const char *path) {
     if (ctx->finalized) {
         return set_error(ctx, CAIRN_ERR_STATE, "context is finalized");
     }
+    if (!ctx->dataset_loaded && ctx->desc.dataset_manifest_path != NULL && ctx->desc.dataset_manifest_path[0] != '\0') {
+        status = cairn_load_dataset(ctx, ctx->desc.dataset_manifest_path);
+        if (status != CAIRN_OK) {
+            return status;
+        }
+    }
     if (path_is_directory(path)) {
         if (!join_path(latest_path, sizeof(latest_path), path, "latest.json")) {
             return set_error(ctx, CAIRN_ERR_IO, "checkpoint latest path is too long");
@@ -1906,34 +2038,15 @@ int cairn_next_batch(cairn_context_t *ctx, cairn_batch_t *batch) {
     batch->step = ctx->step;
     batch->token_offset = ctx->token_offset;
     batch->microbatch_size = ctx->plan_microbatch_size;
-    batch->shard_index = 0;
-    batch->shard_token_offset = ctx->token_offset;
-    batch->tokens_available = UINT64_MAX;
-    batch->shard_path[0] = '\0';
-
-    if (ctx->dataset_loaded) {
-        uint64_t cursor;
-        uint64_t shard_index;
-
-        if (ctx->dataset_total_tokens == 0 || ctx->dataset_shard_count == 0 || ctx->dataset_shards == NULL) {
-            return set_error(ctx, CAIRN_ERR_STATE, "dataset is loaded but has no shards");
-        }
-        cursor = ctx->token_offset % ctx->dataset_total_tokens;
-        for (shard_index = 0; shard_index < ctx->dataset_shard_count; shard_index++) {
-            const cairn_dataset_shard_t *shard = &ctx->dataset_shards[shard_index];
-
-            if (cursor < shard->tokens) {
-                batch->shard_index = (uint32_t)shard_index;
-                batch->shard_token_offset = cursor;
-                batch->tokens_available = shard->tokens - cursor;
-                snprintf(batch->shard_path, sizeof(batch->shard_path), "%s", shard->path);
-                break;
-            }
-            cursor -= shard->tokens;
-        }
-        if (batch->shard_path[0] == '\0') {
-            return set_error(ctx, CAIRN_ERR_STATE, "dataset cursor could not be resolved to a shard");
-        }
+    if (!resolve_dataset_cursor(
+            ctx,
+            ctx->token_offset,
+            &batch->shard_index,
+            &batch->shard_token_offset,
+            &batch->tokens_available,
+            batch->shard_path,
+            sizeof(batch->shard_path))) {
+        return set_error(ctx, CAIRN_ERR_STATE, "dataset cursor could not be resolved to a shard");
     }
     return CAIRN_OK;
 }

@@ -13,10 +13,11 @@ static int expect_ok(int status, const char *label, cairn_context_t *ctx) {
 int main(int argc, char **argv) {
     cairn_context_t *ctx = NULL;
     cairn_init_desc_t desc;
+    cairn_batch_t batch;
     unsigned int world_size;
 
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s RANK_PLAN WORLD_SIZE CHECKPOINT_ROOT\n", argv[0]);
+    if (argc != 4 && argc != 5) {
+        fprintf(stderr, "usage: %s RANK_PLAN WORLD_SIZE CHECKPOINT_ROOT [DATASET_MANIFEST]\n", argv[0]);
         return 2;
     }
     if (sscanf(argv[2], "%u", &world_size) != 1 || world_size == 0) {
@@ -30,7 +31,7 @@ int main(int argc, char **argv) {
     desc.plan_path = argv[1];
     desc.topology_path = NULL;
     desc.checkpoint_path = argv[3];
-    desc.dataset_manifest_path = NULL;
+    desc.dataset_manifest_path = argc == 5 ? argv[4] : NULL;
 
     if (expect_ok(cairn_init(&ctx, &desc), "cairn_init", ctx)) {
         return 1;
@@ -47,6 +48,17 @@ int main(int argc, char **argv) {
         fprintf(stderr, "checkpoint restore returned step 0\n");
         cairn_finalize(ctx);
         return 1;
+    }
+    if (argc == 5) {
+        if (expect_ok(cairn_next_batch(ctx, &batch), "cairn_next_batch", ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (batch.shard_path[0] == '\0' || batch.shard_index != 0 || batch.shard_token_offset != 2) {
+            fprintf(stderr, "checkpoint restore did not recover dataset cursor\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
     }
     if (expect_ok(cairn_finalize(ctx), "cairn_finalize", ctx)) {
         return 1;
