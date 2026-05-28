@@ -1,4 +1,4 @@
-# Static AI Training Stack Design
+# Cairn
 
 This repository contains a design draft for a C-based, fixed-shape AI training stack intended for very large GPU clusters.
 
