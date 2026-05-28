@@ -118,6 +118,7 @@ If the checkpoint was written after loading a dataset manifest, pass the same ma
 
 By default the runtime reserves arena metadata only. Set `CAIRN_ALLOCATE_HOST_ARENA=1` to allocate the full host arena for small local smoke plans that need tensor staging or `cairn_copy_tensor_bytes` inspection. In that mode, the runtime also applies deterministic host-side tensor effects for planned ops so smoke runs can verify dataflow through activation, communication, gradient, and optimizer tensors before GPU kernels exist.
 Host-arena checkpoints include a rank-local binary arena snapshot with an FNV-1a integrity hash, and restore reloads that snapshot when the host arena is allocated.
+Rank checkpoint metadata also includes a `tensor_snapshots` manifest with tensor ids, names, segments, byte ranges, dtype ids, and per-tensor data hashes so restore can validate the arena against the compiled tensor table.
 
 The smoke runtime writes checkpoint artifacts in a shard-like layout:
 

@@ -164,6 +164,15 @@ class RuntimeSmokeTests(unittest.TestCase):
             arena_payload = rank_shard.parent / checkpoint_data["arena_data_path"]
             self.assertTrue(arena_payload.exists())
             self.assertEqual(arena_payload.stat().st_size, checkpoint_data["arena_bytes"])
+            self.assertEqual(checkpoint_data["tensor_snapshot_count"], 9)
+            self.assertGreater(checkpoint_data["tensor_snapshot_fnv1a64"], 0)
+            tensor_snapshots = checkpoint_data["tensor_snapshots"]
+            self.assertEqual(len(tensor_snapshots), checkpoint_data["tensor_snapshot_count"])
+            self.assertEqual(tensor_snapshots[0]["name"], "params_shard")
+            self.assertEqual(tensor_snapshots[3]["name"], "input_tokens")
+            self.assertEqual(tensor_snapshots[3]["segment"], "activation_ring")
+            self.assertEqual(tensor_snapshots[3]["nbytes"], 8192)
+            self.assertGreater(tensor_snapshots[3]["data_fnv1a64"], 0)
             self.assertGreater(checkpoint_data["compute_ops"], 0)
             self.assertGreater(checkpoint_data["communication_ops"], 0)
             self.assertGreater(checkpoint_data["io_ops"], 0)

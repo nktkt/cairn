@@ -445,6 +445,64 @@ static uint64_t hash_bytes_fnv1a64(const unsigned char *bytes, uint64_t nbytes) 
     return hash;
 }
 
+static uint64_t fnv1a64_mix_u64(uint64_t hash, uint64_t value) {
+    int shift;
+
+    for (shift = 0; shift < 64; shift += 8) {
+        hash ^= (value >> shift) & 0xffu;
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+static uint64_t fnv1a64_mix_string(uint64_t hash, const char *value) {
+    const unsigned char *cursor;
+
+    if (value == NULL) {
+        return fnv1a64_mix_u64(hash, 0);
+    }
+    for (cursor = (const unsigned char *)value; *cursor != '\0'; cursor++) {
+        hash ^= (uint64_t)*cursor;
+        hash *= 1099511628211ull;
+    }
+    return fnv1a64_mix_u64(hash, 0xffu);
+}
+
+static uint64_t tensor_data_hash(const cairn_context_t *ctx, const cairn_tensor_t *tensor) {
+    if (ctx == NULL || tensor == NULL || !ctx->arena_allocated || ctx->arena == NULL) {
+        return 0;
+    }
+    if (tensor->offset > ctx->arena_bytes || tensor->nbytes > ctx->arena_bytes - tensor->offset) {
+        return 0;
+    }
+    if ((uint64_t)((size_t)tensor->offset) != tensor->offset || (uint64_t)((size_t)tensor->nbytes) != tensor->nbytes) {
+        return 0;
+    }
+    return hash_bytes_fnv1a64(((const unsigned char *)ctx->arena) + (size_t)tensor->offset, tensor->nbytes);
+}
+
+static uint64_t tensor_snapshot_manifest_hash(const cairn_context_t *ctx) {
+    uint64_t hash;
+    uint64_t index;
+
+    hash = 1469598103934665603ull;
+    if (ctx == NULL || ctx->tensors == NULL) {
+        return hash;
+    }
+    for (index = 0; index < ctx->tensor_count; index++) {
+        const cairn_tensor_t *tensor = &ctx->tensors[index];
+
+        hash = fnv1a64_mix_u64(hash, tensor->tensor_id);
+        hash = fnv1a64_mix_string(hash, tensor->name);
+        hash = fnv1a64_mix_string(hash, tensor->segment);
+        hash = fnv1a64_mix_u64(hash, tensor->offset);
+        hash = fnv1a64_mix_u64(hash, tensor->nbytes);
+        hash = fnv1a64_mix_u64(hash, tensor->dtype_id);
+        hash = fnv1a64_mix_u64(hash, tensor_data_hash(ctx, tensor));
+    }
+    return hash;
+}
+
 static int write_binary_atomic(cairn_context_t *ctx, const char *path, const void *data, uint64_t nbytes) {
     FILE *file;
     char tmp_path[CAIRN_PATH_MAX];
@@ -1376,6 +1434,106 @@ static int restore_checkpoint_arena_data(cairn_context_t *ctx, const char *conte
     return CAIRN_OK;
 }
 
+static int validate_checkpoint_tensor_snapshots(cairn_context_t *ctx, const char *contents) {
+    const char *snapshots_start;
+    const char *snapshots_end;
+    const char *cursor;
+    uint64_t parsed;
+    uint64_t expected_manifest_hash;
+    uint64_t actual_manifest_hash;
+    uint64_t count;
+    uint64_t index;
+
+    if (ctx == NULL || contents == NULL) {
+        return CAIRN_ERR_INVALID_ARGUMENT;
+    }
+    if (!parse_json_u64(contents, "tensor_snapshot_count", &count)) {
+        return CAIRN_OK;
+    }
+    if (count != ctx->tensor_count) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot count does not match loaded plan");
+    }
+    if (!parse_json_u64(contents, "tensor_snapshot_fnv1a64", &expected_manifest_hash)) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot manifest hash is missing");
+    }
+    actual_manifest_hash = tensor_snapshot_manifest_hash(ctx);
+    if (actual_manifest_hash != expected_manifest_hash) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot manifest hash does not match loaded plan");
+    }
+
+    snapshots_start = find_json_array(contents, "tensor_snapshots", &snapshots_end);
+    if (snapshots_start == NULL || snapshots_end == NULL || snapshots_end <= snapshots_start) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot array is missing");
+    }
+    if (count_occurrences_range(snapshots_start, snapshots_end, "\"tensor_id\"") != count) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot array count is invalid");
+    }
+
+    cursor = snapshots_start;
+    index = 0;
+    while ((cursor = strstr(cursor, "\"tensor_id\"")) != NULL && cursor < snapshots_end) {
+        const char *object_start;
+        const char *object_end;
+        char *object_json;
+        char name[64];
+        char segment[64];
+        const cairn_tensor_t *tensor;
+
+        if (index >= count) {
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot array has too many entries");
+        }
+        object_start = reverse_find_char(snapshots_start, cursor, '{');
+        object_end = strchr(cursor, '}');
+        if (object_start == NULL || object_end == NULL || object_end > snapshots_end) {
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot object is invalid");
+        }
+        object_json = copy_range(object_start, object_end);
+        if (object_json == NULL) {
+            return set_error(ctx, CAIRN_ERR_STATE, "checkpoint tensor snapshot object could not be allocated");
+        }
+
+        tensor = &ctx->tensors[index];
+        if (!parse_json_u64(object_json, "tensor_id", &parsed) || parsed != tensor->tensor_id) {
+            free(object_json);
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot id does not match loaded plan");
+        }
+        if (!parse_json_string(object_json, "name", name, sizeof(name)) || strcmp(name, tensor->name) != 0) {
+            free(object_json);
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot name does not match loaded plan");
+        }
+        if (!parse_json_string(object_json, "segment", segment, sizeof(segment)) || strcmp(segment, tensor->segment) != 0) {
+            free(object_json);
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot segment does not match loaded plan");
+        }
+        if (!parse_json_u64(object_json, "offset", &parsed) || parsed != tensor->offset) {
+            free(object_json);
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot offset does not match loaded plan");
+        }
+        if (!parse_json_u64(object_json, "nbytes", &parsed) || parsed != tensor->nbytes) {
+            free(object_json);
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot size does not match loaded plan");
+        }
+        if (!parse_json_u64(object_json, "dtype_id", &parsed) || parsed != tensor->dtype_id) {
+            free(object_json);
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot dtype does not match loaded plan");
+        }
+        if (ctx->arena_allocated && ctx->arena != NULL) {
+            if (!parse_json_u64(object_json, "data_fnv1a64", &parsed) || parsed != tensor_data_hash(ctx, tensor)) {
+                free(object_json);
+                return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot data hash does not match restored arena");
+            }
+        }
+
+        free(object_json);
+        index++;
+        cursor = object_end + 1;
+    }
+    if (index != count) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint tensor snapshot array has too few entries");
+    }
+    return CAIRN_OK;
+}
+
 static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     FILE *file;
     char tmp_path[CAIRN_PATH_MAX];
@@ -1386,6 +1544,8 @@ static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     uint32_t dataset_cursor_shard_index;
     uint64_t dataset_cursor_shard_token_offset;
     uint64_t dataset_cursor_tokens_available;
+    uint64_t tensor_index;
+    uint64_t tensor_manifest_hash;
 
     if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) <= 0 || strlen(path) + 4 >= sizeof(tmp_path)) {
         return set_error(ctx, CAIRN_ERR_IO, "rank checkpoint temporary path is too long");
@@ -1408,6 +1568,7 @@ static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     dataset_cursor_shard_index = 0;
     dataset_cursor_shard_token_offset = 0;
     dataset_cursor_tokens_available = 0;
+    tensor_manifest_hash = tensor_snapshot_manifest_hash(ctx);
     if (ctx->dataset_loaded) {
         if (!resolve_dataset_cursor(
                 ctx,
@@ -1451,6 +1612,24 @@ static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     fprintf(file, "  \"arena_data_path\": \"%s\",\n", arena_file_name);
     fprintf(file, "  \"arena_data_nbytes\": %llu,\n", arena_file_name[0] != '\0' ? (unsigned long long)ctx->arena_bytes : 0ull);
     fprintf(file, "  \"arena_data_fnv1a64\": %llu,\n", (unsigned long long)arena_hash);
+    fprintf(file, "  \"tensor_snapshot_count\": %llu,\n", (unsigned long long)ctx->tensor_count);
+    fprintf(file, "  \"tensor_snapshot_fnv1a64\": %llu,\n", (unsigned long long)tensor_manifest_hash);
+    fprintf(file, "  \"tensor_snapshots\": [\n");
+    for (tensor_index = 0; tensor_index < ctx->tensor_count; tensor_index++) {
+        const cairn_tensor_t *tensor = &ctx->tensors[tensor_index];
+
+        fprintf(file,
+                "    {\"tensor_id\": %u, \"name\": \"%s\", \"segment\": \"%s\", \"offset\": %llu, \"nbytes\": %llu, \"dtype_id\": %u, \"data_fnv1a64\": %llu}%s\n",
+                tensor->tensor_id,
+                tensor->name,
+                tensor->segment,
+                (unsigned long long)tensor->offset,
+                (unsigned long long)tensor->nbytes,
+                tensor->dtype_id,
+                (unsigned long long)tensor_data_hash(ctx, tensor),
+                tensor_index + 1 == ctx->tensor_count ? "" : ",");
+    }
+    fprintf(file, "  ],\n");
     fprintf(file, "  \"ops_executed\": %llu,\n", (unsigned long long)ctx->stats.ops_executed);
     fprintf(file, "  \"compute_ops\": %llu,\n", (unsigned long long)ctx->stats.compute_ops);
     fprintf(file, "  \"communication_ops\": %llu,\n", (unsigned long long)ctx->stats.communication_ops);
@@ -2239,6 +2418,11 @@ int cairn_load_checkpoint(cairn_context_t *ctx, const char *path) {
         return status;
     }
     status = restore_checkpoint_arena_data(ctx, contents, rank_shard_path);
+    if (status != CAIRN_OK) {
+        free(contents);
+        return status;
+    }
+    status = validate_checkpoint_tensor_snapshots(ctx, contents);
     free(contents);
     if (status != CAIRN_OK) {
         return status;
