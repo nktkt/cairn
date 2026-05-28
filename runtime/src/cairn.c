@@ -286,6 +286,46 @@ static int parse_json_u64(const char *json, const char *key, uint64_t *out) {
     return 1;
 }
 
+static int parse_json_bool(const char *json, const char *key, int *out) {
+    const char *cursor;
+
+    if (out == NULL) {
+        return 0;
+    }
+    cursor = find_json_key(json, key);
+    if (cursor == NULL) {
+        return 0;
+    }
+    cursor = strchr(cursor, ':');
+    if (cursor == NULL) {
+        return 0;
+    }
+    cursor++;
+    while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+    if (strncmp(cursor, "true", 4) == 0) {
+        *out = 1;
+        return 1;
+    }
+    if (strncmp(cursor, "false", 5) == 0) {
+        *out = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int atomic_publish(const char *tmp_path, const char *final_path) {
+    if (tmp_path == NULL || final_path == NULL) {
+        return 0;
+    }
+    if (rename(tmp_path, final_path) != 0) {
+        remove(tmp_path);
+        return 0;
+    }
+    return 1;
+}
+
 static uint64_t count_occurrences_range(const char *text, const char *end, const char *needle) {
     uint64_t count;
     size_t needle_len;
@@ -734,8 +774,13 @@ static int restore_checkpoint_contents(cairn_context_t *ctx, const char *content
 
 static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     FILE *file;
+    char tmp_path[CAIRN_PATH_MAX];
 
-    file = fopen(path, "wb");
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) <= 0 || strlen(path) + 4 >= sizeof(tmp_path)) {
+        return set_error(ctx, CAIRN_ERR_IO, "rank checkpoint temporary path is too long");
+    }
+
+    file = fopen(tmp_path, "wb");
     if (file == NULL) {
         return set_error(ctx, CAIRN_ERR_IO, "rank checkpoint shard could not be opened for writing");
     }
@@ -760,7 +805,11 @@ static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     fprintf(file, "  \"io_bytes\": %llu\n", (unsigned long long)ctx->stats.io_bytes);
     fprintf(file, "}\n");
     if (fclose(file) != 0) {
+        remove(tmp_path);
         return set_error(ctx, CAIRN_ERR_IO, "rank checkpoint shard could not be closed");
+    }
+    if (!atomic_publish(tmp_path, path)) {
+        return set_error(ctx, CAIRN_ERR_IO, "rank checkpoint shard could not be published");
     }
     return CAIRN_OK;
 }
@@ -942,6 +991,7 @@ int cairn_load_checkpoint(cairn_context_t *ctx, const char *path) {
     char manifest_dir[CAIRN_PATH_MAX];
     char rank_shard_rel[CAIRN_PATH_MAX];
     char rank_shard_path[CAIRN_PATH_MAX];
+    int complete;
     int status;
 
     if (ctx == NULL || path == NULL) {
@@ -963,6 +1013,10 @@ int cairn_load_checkpoint(cairn_context_t *ctx, const char *path) {
             free(contents);
             return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint latest manifest does not contain manifest_path");
         }
+        if (!parse_json_bool(contents, "complete", &complete) || !complete) {
+            free(contents);
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint latest manifest is incomplete");
+        }
         free(contents);
 
         if (!join_path(manifest_path, sizeof(manifest_path), path, manifest_rel)) {
@@ -976,6 +1030,10 @@ int cairn_load_checkpoint(cairn_context_t *ctx, const char *path) {
         if (!parse_json_string(contents, "rank_shard_path", rank_shard_rel, sizeof(rank_shard_rel))) {
             free(contents);
             return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint manifest does not contain rank_shard_path");
+        }
+        if (!parse_json_bool(contents, "complete", &complete) || !complete) {
+            free(contents);
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint manifest is incomplete");
         }
         if (!dirname_of(manifest_dir, sizeof(manifest_dir), manifest_path)) {
             free(contents);
@@ -1085,6 +1143,8 @@ int cairn_save_checkpoint(cairn_context_t *ctx, const char *tag) {
     char manifest_path[CAIRN_PATH_MAX];
     char latest_path[CAIRN_PATH_MAX];
     char manifest_rel[CAIRN_PATH_MAX];
+    char manifest_tmp[CAIRN_PATH_MAX];
+    char latest_tmp[CAIRN_PATH_MAX];
     int status;
 
     if (ctx == NULL || tag == NULL || tag[0] == '\0') {
@@ -1125,7 +1185,10 @@ int cairn_save_checkpoint(cairn_context_t *ctx, const char *tag) {
     if (!join_path(manifest_path, sizeof(manifest_path), step_dir, "manifest.json")) {
         return set_error(ctx, CAIRN_ERR_IO, "checkpoint manifest path is too long");
     }
-    file = fopen(manifest_path, "wb");
+    if (snprintf(manifest_tmp, sizeof(manifest_tmp), "%s.tmp", manifest_path) <= 0 || strlen(manifest_path) + 4 >= sizeof(manifest_tmp)) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint temporary manifest path is too long");
+    }
+    file = fopen(manifest_tmp, "wb");
     if (file == NULL) {
         return set_error(ctx, CAIRN_ERR_IO, "checkpoint manifest could not be opened for writing");
     }
@@ -1135,10 +1198,15 @@ int cairn_save_checkpoint(cairn_context_t *ctx, const char *tag) {
     fprintf(file, "  \"world_size\": %u,\n", ctx->plan_world_size);
     fprintf(file, "  \"step\": %llu,\n", (unsigned long long)ctx->step);
     fprintf(file, "  \"rank_count\": 1,\n");
-    fprintf(file, "  \"rank_shard_path\": \"ranks/%s\"\n", rank_file_name);
+    fprintf(file, "  \"rank_shard_path\": \"ranks/%s\",\n", rank_file_name);
+    fprintf(file, "  \"complete\": true\n");
     fprintf(file, "}\n");
     if (fclose(file) != 0) {
+        remove(manifest_tmp);
         return set_error(ctx, CAIRN_ERR_IO, "checkpoint manifest could not be closed");
+    }
+    if (!atomic_publish(manifest_tmp, manifest_path)) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint manifest could not be published");
     }
 
     if (!join_path(latest_path, sizeof(latest_path), tag, "latest.json")) {
@@ -1147,7 +1215,10 @@ int cairn_save_checkpoint(cairn_context_t *ctx, const char *tag) {
     if (!join_path(manifest_rel, sizeof(manifest_rel), step_name, "manifest.json")) {
         return set_error(ctx, CAIRN_ERR_IO, "checkpoint relative manifest path is too long");
     }
-    file = fopen(latest_path, "wb");
+    if (snprintf(latest_tmp, sizeof(latest_tmp), "%s.tmp", latest_path) <= 0 || strlen(latest_path) + 4 >= sizeof(latest_tmp)) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint temporary latest path is too long");
+    }
+    file = fopen(latest_tmp, "wb");
     if (file == NULL) {
         return set_error(ctx, CAIRN_ERR_IO, "checkpoint latest manifest could not be opened for writing");
     }
@@ -1155,10 +1226,15 @@ int cairn_save_checkpoint(cairn_context_t *ctx, const char *tag) {
     fprintf(file, "  \"version\": 1,\n");
     fprintf(file, "  \"plan_id\": \"%s\",\n", ctx->plan_id);
     fprintf(file, "  \"step\": %llu,\n", (unsigned long long)ctx->step);
-    fprintf(file, "  \"manifest_path\": \"%s\"\n", manifest_rel);
+    fprintf(file, "  \"manifest_path\": \"%s\",\n", manifest_rel);
+    fprintf(file, "  \"complete\": true\n");
     fprintf(file, "}\n");
     if (fclose(file) != 0) {
+        remove(latest_tmp);
         return set_error(ctx, CAIRN_ERR_IO, "checkpoint latest manifest could not be closed");
+    }
+    if (!atomic_publish(latest_tmp, latest_path)) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint latest manifest could not be published");
     }
     return CAIRN_OK;
 }

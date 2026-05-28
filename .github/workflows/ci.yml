@@ -22,6 +22,13 @@ jobs:
           runtime/src/cairn.c
           runtime/examples/smoke.c
           -o /tmp/cairn-runtime-smoke
+      - name: Build runtime restore binary
+        run: >-
+          cc -std=c11 -Wall -Wextra -Werror
+          -I runtime/include
+          runtime/src/cairn.c
+          runtime/examples/restore.c
+          -o /tmp/cairn-runtime-restore
       - name: Validate example bundle
         run: >-
           PYTHONPATH=src python -m cairn validate
@@ -42,3 +49,4 @@ jobs:
           PYTHONPATH=src python -m cairn simulate build/plan --out build/simulation-report.json
           PYTHONPATH=src python -m cairn report build/simulation-report.json
           /tmp/cairn-runtime-smoke build/plan/ranks/rank_000000.json 8 /tmp/cairn-checkpoints
+          /tmp/cairn-runtime-restore build/plan/ranks/rank_000000.json 8 /tmp/cairn-checkpoints

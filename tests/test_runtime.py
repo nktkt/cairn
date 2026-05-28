@@ -26,6 +26,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             temp_path = Path(temp)
             plan_dir = temp_path / "plan"
             binary = temp_path / "runtime-smoke"
+            restore_binary = temp_path / "runtime-restore"
             checkpoint = temp_path / "checkpoint"
             compile_plan(
                 model=load_example("model"),
@@ -55,6 +56,26 @@ class RuntimeSmokeTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
+            restore_compile_result = subprocess.run(
+                [
+                    "cc",
+                    "-std=c11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-I",
+                    str(ROOT / "runtime" / "include"),
+                    str(ROOT / "runtime" / "src" / "cairn.c"),
+                    str(ROOT / "runtime" / "examples" / "restore.c"),
+                    "-o",
+                    str(restore_binary),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(restore_compile_result.returncode, 0, restore_compile_result.stderr)
 
             run_result = subprocess.run(
                 [str(binary), str(plan_dir / "ranks" / "rank_000000.json"), "8", str(checkpoint)],
@@ -69,9 +90,11 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertIn("segments=7", run_result.stdout)
             self.assertTrue((checkpoint / "latest.json").exists())
             latest_data = load_json(checkpoint / "latest.json")
+            self.assertTrue(latest_data["complete"])
             manifest_path = checkpoint / latest_data["manifest_path"]
             self.assertTrue(manifest_path.exists())
             manifest_data = load_json(manifest_path)
+            self.assertTrue(manifest_data["complete"])
             self.assertEqual(manifest_data["rank_count"], 1)
             rank_shard = manifest_path.parent / manifest_data["rank_shard_path"]
             self.assertTrue(rank_shard.exists())
@@ -86,6 +109,58 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertGreater(checkpoint_data["compute_bytes"], 0)
             self.assertGreater(checkpoint_data["communication_bytes"], 0)
             self.assertGreater(checkpoint_data["io_bytes"], 0)
+            restore_result = subprocess.run(
+                [str(restore_binary), str(plan_dir / "ranks" / "rank_000000.json"), "8", str(checkpoint)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(restore_result.returncode, 0, restore_result.stderr)
+            self.assertIn("cairn restore smoke ok", restore_result.stdout)
+
+            incomplete_checkpoint = temp_path / "incomplete-checkpoint"
+            shutil.copytree(checkpoint, incomplete_checkpoint)
+            incomplete_latest = load_json(incomplete_checkpoint / "latest.json")
+            incomplete_latest["complete"] = False
+            (incomplete_checkpoint / "latest.json").write_text(
+                json.dumps(incomplete_latest, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            incomplete_result = subprocess.run(
+                [str(restore_binary), str(plan_dir / "ranks" / "rank_000000.json"), "8", str(incomplete_checkpoint)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(incomplete_result.returncode, 0)
+            self.assertIn("incomplete", incomplete_result.stderr)
+
+            incomplete_manifest_checkpoint = temp_path / "incomplete-manifest-checkpoint"
+            shutil.copytree(checkpoint, incomplete_manifest_checkpoint)
+            incomplete_manifest_latest = load_json(incomplete_manifest_checkpoint / "latest.json")
+            incomplete_manifest_path = incomplete_manifest_checkpoint / incomplete_manifest_latest["manifest_path"]
+            incomplete_manifest = load_json(incomplete_manifest_path)
+            incomplete_manifest["complete"] = False
+            incomplete_manifest_path.write_text(
+                json.dumps(incomplete_manifest, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
+            incomplete_manifest_result = subprocess.run(
+                [
+                    str(restore_binary),
+                    str(plan_dir / "ranks" / "rank_000000.json"),
+                    "8",
+                    str(incomplete_manifest_checkpoint),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(incomplete_manifest_result.returncode, 0)
+            self.assertIn("incomplete", incomplete_manifest_result.stderr)
 
             mismatch_result = subprocess.run(
                 [str(binary), str(plan_dir / "ranks" / "rank_000000.json"), "7", str(temp_path / "bad-checkpoint")],
