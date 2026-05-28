@@ -33,11 +33,23 @@ typedef enum {
     CAIRN_ERR_STATE = 4
 } cairn_status_t;
 
+typedef struct {
+    uint64_t steps_executed;
+    uint64_t ops_executed;
+    uint64_t compute_ops;
+    uint64_t communication_ops;
+    uint64_t io_ops;
+    uint64_t compute_bytes;
+    uint64_t communication_bytes;
+    uint64_t io_bytes;
+} cairn_runtime_stats_t;
+
 int cairn_init(cairn_context_t **ctx, const cairn_init_desc_t *desc);
 int cairn_load_plan(cairn_context_t *ctx, const char *path);
 int cairn_load_checkpoint(cairn_context_t *ctx, const char *path);
 int cairn_next_batch(cairn_context_t *ctx, cairn_batch_t *batch);
 int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch);
+int cairn_get_stats(const cairn_context_t *ctx, cairn_runtime_stats_t *stats);
 int cairn_should_checkpoint(cairn_context_t *ctx);
 int cairn_save_checkpoint(cairn_context_t *ctx, const char *tag);
 int cairn_finalize(cairn_context_t *ctx);

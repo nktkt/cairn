@@ -66,7 +66,11 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertIn("cairn runtime smoke ok", run_result.stdout)
             self.assertIn("ops=17", run_result.stdout)
             self.assertTrue(checkpoint.exists())
-            self.assertEqual(load_json(checkpoint)["step"], 1)
+            checkpoint_data = load_json(checkpoint)
+            self.assertEqual(checkpoint_data["step"], 1)
+            self.assertEqual(checkpoint_data["ops_executed"], 17)
+            self.assertGreater(checkpoint_data["communication_bytes"], 0)
+            self.assertGreater(checkpoint_data["io_bytes"], 0)
 
             mismatch_result = subprocess.run(
                 [str(binary), str(plan_dir / "ranks" / "rank_000000.json"), "7", str(temp_path / "bad.json")],

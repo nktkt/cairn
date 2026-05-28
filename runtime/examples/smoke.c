@@ -14,6 +14,7 @@ static int expect_ok(int status, const char *label, cairn_context_t *ctx) {
 int main(int argc, char **argv) {
     cairn_context_t *ctx = NULL;
     cairn_batch_t batch;
+    cairn_runtime_stats_t stats;
     cairn_init_desc_t desc;
     unsigned int world_size;
     char plan_id[65];
@@ -59,6 +60,20 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (expect_ok(cairn_train_step(ctx, &batch), "cairn_train_step", ctx)) {
+        cairn_finalize(ctx);
+        return 1;
+    }
+    if (expect_ok(cairn_get_stats(ctx, &stats), "cairn_get_stats", ctx)) {
+        cairn_finalize(ctx);
+        return 1;
+    }
+    if (stats.steps_executed != 1 || stats.ops_executed != cairn_plan_op_count(ctx)) {
+        fprintf(stderr, "runtime stats did not track executed op table\n");
+        cairn_finalize(ctx);
+        return 1;
+    }
+    if (stats.compute_ops == 0 || stats.communication_ops == 0 || stats.io_ops == 0) {
+        fprintf(stderr, "runtime stats did not classify compute/communication/io ops\n");
         cairn_finalize(ctx);
         return 1;
     }
