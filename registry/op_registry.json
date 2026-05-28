@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "streams": {
+    "compute_hi": "compute",
+    "compute_lo": "compute",
+    "comm_tp": "communication",
+    "comm_pp": "communication",
+    "comm_dp": "communication",
+    "io": "io"
+  },
+  "ops": [
+    {
+      "kind": "rmsnorm",
+      "class": "compute",
+      "default_stream": "compute_lo"
+    },
+    {
+      "kind": "attention_fwd",
+      "class": "compute",
+      "default_stream": "compute_hi"
+    },
+    {
+      "kind": "attention_bwd",
+      "class": "compute",
+      "default_stream": "compute_hi"
+    },
+    {
+      "kind": "mlp_fwd",
+      "class": "compute",
+      "default_stream": "compute_hi"
+    },
+    {
+      "kind": "mlp_bwd",
+      "class": "compute",
+      "default_stream": "compute_hi"
+    },
+    {
+      "kind": "optimizer",
+      "class": "compute",
+      "default_stream": "compute_lo"
+    },
+    {
+      "kind": "all_reduce",
+      "class": "communication",
+      "default_stream": "comm_tp"
+    },
+    {
+      "kind": "reduce_scatter",
+      "class": "communication",
+      "default_stream": "comm_dp"
+    },
+    {
+      "kind": "all_gather",
+      "class": "communication",
+      "default_stream": "comm_dp"
+    },
+    {
+      "kind": "pipe_send_activation",
+      "class": "communication",
+      "default_stream": "comm_pp"
+    },
+    {
+      "kind": "pipe_recv_activation_grad",
+      "class": "communication",
+      "default_stream": "comm_pp"
+    },
+    {
+      "kind": "checkpoint_stage",
+      "class": "io",
+      "default_stream": "io"
+    }
+  ]
+}

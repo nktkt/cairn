@@ -6,6 +6,7 @@ from typing import Any
 
 from .jsonutil import canonical_json, write_json
 from .mapping import assign_layers, build_comm_groups, build_rank_map
+from .op_registry import registry_metadata, validate_op
 from .validation import estimate_memory_bytes, required_world_size, validate_bundle
 
 
@@ -41,6 +42,7 @@ def compile_plan(
     comm_groups = build_comm_groups(training)
     layer_assignments = assign_layers(model, training)
     memory = build_memory_layout(model, training)
+    op_registry = registry_metadata()
 
     compiler_inputs = {
         "model": model,
@@ -52,12 +54,15 @@ def compile_plan(
         "comm_groups": comm_groups,
         "layer_assignments": layer_assignments,
         "memory": memory,
+        "op_registry": op_registry,
     }
     plan_id = hashlib.sha256(canonical_json(compiler_inputs)).hexdigest()
 
     manifest = {
         "version": 1,
         "plan_id": plan_id,
+        "op_registry_version": op_registry["version"],
+        "op_registry_sha256": op_registry["sha256"],
         "world_size": required_world_size(training),
         "model": {
             "family": model["family"],
@@ -101,6 +106,7 @@ def compile_plan(
             training=training,
             layer_assignments=layer_assignments,
             memory=memory,
+            op_registry=op_registry,
         )
         write_json(ranks_dir / f"rank_{rank['global_rank']:06d}.json", rank_plan)
 
@@ -147,6 +153,7 @@ def build_rank_plan(
     training: dict[str, Any],
     layer_assignments: list[dict[str, Any]],
     memory: dict[str, Any],
+    op_registry: dict[str, Any],
 ) -> dict[str, Any]:
     pp = rank["pipeline_index"]
     tensor = training["parallelism"]["tensor"]
@@ -190,6 +197,8 @@ def build_rank_plan(
     return {
         "version": 1,
         "plan_id": plan_id,
+        "op_registry_version": op_registry["version"],
+        "op_registry_sha256": op_registry["sha256"],
         "world_size": (
             training["parallelism"]["tensor"]
             * training["parallelism"]["pipeline"]
@@ -210,9 +219,11 @@ def build_rank_plan(
 
 
 def op(op_id: int, kind: str, stream: str, **kwargs: Any) -> dict[str, Any]:
+    klass = validate_op(kind, stream)
     return {
         "op_id": op_id,
         "kind": kind,
+        "op_class": klass,
         "stream": stream,
         **kwargs,
     }

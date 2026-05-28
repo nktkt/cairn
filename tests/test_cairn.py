@@ -11,6 +11,7 @@ from pathlib import Path
 from cairn.compiler import compile_plan
 from cairn.jsonutil import load_json
 from cairn.mapping import build_comm_groups, build_rank_map
+from cairn.op_registry import OP_REGISTRY_SHA256, OP_REGISTRY_VERSION, supported_op_kinds
 from cairn.simulator import simulate_plan
 from cairn.validation import validate_bundle
 
@@ -67,6 +68,16 @@ class MappingTests(unittest.TestCase):
 
 
 class CompileTests(unittest.TestCase):
+    def test_op_registry_generated_files_are_current(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "tools/generate_op_registry.py", "--check"],
+            cwd=ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
     def test_compile_is_deterministic(self) -> None:
         model = load_example("model")
         training = load_example("training")
@@ -91,6 +102,25 @@ class CompileTests(unittest.TestCase):
                 out_dir=Path(b),
             )
             self.assertEqual(digest_tree(Path(a)), digest_tree(Path(b)))
+
+    def test_compiled_plan_records_op_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as out:
+            compile_plan(
+                model=load_example("model"),
+                training=load_example("training"),
+                topology=load_example("topology"),
+                dataset=load_example("dataset"),
+                checkpoint=load_example("checkpoint"),
+                out_dir=Path(out),
+            )
+            manifest = load_json(Path(out) / "manifest.json")
+            rank_plan = load_json(Path(out) / "ranks" / "rank_000000.json")
+            self.assertEqual(manifest["op_registry_version"], OP_REGISTRY_VERSION)
+            self.assertEqual(manifest["op_registry_sha256"], OP_REGISTRY_SHA256)
+            self.assertEqual(rank_plan["op_registry_sha256"], OP_REGISTRY_SHA256)
+            kinds = {op["kind"] for op in rank_plan["ops"]}
+            self.assertLessEqual(kinds, supported_op_kinds())
+            self.assertTrue(all("op_class" in op for op in rank_plan["ops"]))
 
     def test_simulator_reports_pipeline_and_failure(self) -> None:
         with tempfile.TemporaryDirectory() as out:

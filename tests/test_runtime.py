@@ -214,6 +214,20 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertNotEqual(bad_stream_result.returncode, 0)
             self.assertIn("op table", bad_stream_result.stderr)
 
+            bad_registry = temp_path / "bad-registry-plan.json"
+            bad_registry_data = load_json(plan_dir / "ranks" / "rank_000000.json")
+            bad_registry_data["op_registry_sha256"] = "0" * 64
+            bad_registry.write_text(json.dumps(bad_registry_data, indent=2, sort_keys=True), encoding="utf-8")
+            bad_registry_result = subprocess.run(
+                [str(binary), str(bad_registry), "8", str(temp_path / "bad-registry-checkpoint")],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(bad_registry_result.returncode, 0)
+            self.assertIn("op registry hash", bad_registry_result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

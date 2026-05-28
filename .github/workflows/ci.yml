@@ -15,6 +15,8 @@ jobs:
           python-version: "3.12"
       - name: Run unit tests
         run: PYTHONPATH=src python -m unittest discover -s tests -v
+      - name: Check generated op registry
+        run: python tools/generate_op_registry.py --check
       - name: Build runtime smoke binary
         run: >-
           cc -std=c11 -Wall -Wextra -Werror

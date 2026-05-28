@@ -38,7 +38,8 @@ The current implementation includes:
 - `cairn compile` for deterministic static plan generation
 - `cairn simulate` for pipeline, memory, communication, checkpoint, and failure-injection reports
 - `cairn report` for compact report summaries
-- a C ABI/runtime dry-run skeleton that loads rank plans, validates memory segments, reserves arena metadata, rejects unsupported op kinds, executes op tables, records stats, and writes checkpoint manifests
+- a shared op registry used by both the Python compiler and C runtime
+- a C ABI/runtime dry-run skeleton that loads rank plans, validates memory segments, reserves arena metadata, rejects unsupported op kinds or registry mismatches, executes op tables, records stats, and writes checkpoint manifests
 - small example specs under [examples/small](examples/small)
 - unit tests and GitHub Actions CI
 

@@ -1,4 +1,5 @@
 #include "cairn/cairn.h"
+#include "cairn/op_registry.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,12 +10,6 @@
 #include <sys/types.h>
 
 #define CAIRN_PATH_MAX 1024
-
-typedef enum {
-    CAIRN_OP_CLASS_COMPUTE = 0,
-    CAIRN_OP_CLASS_COMMUNICATION = 1,
-    CAIRN_OP_CLASS_IO = 2
-} cairn_op_class_t;
 
 typedef struct {
     uint64_t op_id;
@@ -51,26 +46,6 @@ struct cairn_context {
     int plan_loaded;
     int checkpoint_loaded;
     int finalized;
-};
-
-typedef struct {
-    const char *kind;
-    cairn_op_class_t op_class;
-} cairn_executor_desc_t;
-
-static const cairn_executor_desc_t CAIRN_EXECUTORS[] = {
-    {"rmsnorm", CAIRN_OP_CLASS_COMPUTE},
-    {"attention_fwd", CAIRN_OP_CLASS_COMPUTE},
-    {"attention_bwd", CAIRN_OP_CLASS_COMPUTE},
-    {"mlp_fwd", CAIRN_OP_CLASS_COMPUTE},
-    {"mlp_bwd", CAIRN_OP_CLASS_COMPUTE},
-    {"optimizer", CAIRN_OP_CLASS_COMPUTE},
-    {"all_reduce", CAIRN_OP_CLASS_COMMUNICATION},
-    {"reduce_scatter", CAIRN_OP_CLASS_COMMUNICATION},
-    {"all_gather", CAIRN_OP_CLASS_COMMUNICATION},
-    {"pipe_send_activation", CAIRN_OP_CLASS_COMMUNICATION},
-    {"pipe_recv_activation_grad", CAIRN_OP_CLASS_COMMUNICATION},
-    {"checkpoint_stage", CAIRN_OP_CLASS_IO}
 };
 
 static int set_error(cairn_context_t *ctx, int code, const char *message) {
@@ -362,7 +337,7 @@ static int lookup_executor(const char *kind, cairn_op_class_t *out_class) {
     if (kind == NULL || out_class == NULL) {
         return 0;
     }
-    for (index = 0; index < sizeof(CAIRN_EXECUTORS) / sizeof(CAIRN_EXECUTORS[0]); index++) {
+    for (index = 0; index < CAIRN_EXECUTOR_COUNT; index++) {
         if (strcmp(kind, CAIRN_EXECUTORS[index].kind) == 0) {
             *out_class = CAIRN_EXECUTORS[index].op_class;
             return 1;
@@ -890,6 +865,7 @@ int cairn_load_plan(cairn_context_t *ctx, const char *path) {
     uint64_t loaded_arena_bytes;
     cairn_plan_op_t *loaded_ops;
     cairn_memory_segment_t *loaded_segments;
+    char loaded_registry_sha[65];
 
     if (ctx == NULL || path == NULL) {
         return CAIRN_ERR_INVALID_ARGUMENT;
@@ -916,10 +892,23 @@ int cairn_load_plan(cairn_context_t *ctx, const char *path) {
     loaded_arena_bytes = 0;
     loaded_ops = NULL;
     loaded_segments = NULL;
+    loaded_registry_sha[0] = '\0';
 
     if (!parse_json_string(contents, "plan_id", loaded_plan_id, sizeof(loaded_plan_id))) {
         free(contents);
         return set_error(ctx, CAIRN_ERR_PLAN, "plan file does not contain plan_id");
+    }
+    if (!parse_json_u64(contents, "op_registry_version", &parsed) || parsed != CAIRN_OP_REGISTRY_VERSION) {
+        free(contents);
+        return set_error(ctx, CAIRN_ERR_PLAN, "plan op registry version does not match runtime");
+    }
+    if (!parse_json_string(contents, "op_registry_sha256", loaded_registry_sha, sizeof(loaded_registry_sha))) {
+        free(contents);
+        return set_error(ctx, CAIRN_ERR_PLAN, "plan op registry hash is missing");
+    }
+    if (strcmp(loaded_registry_sha, CAIRN_OP_REGISTRY_SHA256) != 0) {
+        free(contents);
+        return set_error(ctx, CAIRN_ERR_PLAN, "plan op registry hash does not match runtime");
     }
     if (parse_json_u64(contents, "world_size", &parsed)) {
         if (parsed == 0 || parsed > UINT32_MAX) {
