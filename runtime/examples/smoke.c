@@ -184,11 +184,41 @@ int main(int argc, char **argv) {
                 cairn_finalize(ctx);
                 return 1;
             }
+            if (expect_ok(cairn_stage_batch_input(ctx, &wrap_batch, &tokens_staged),
+                          "cairn_stage_batch_input_wrap",
+                          ctx)) {
+                cairn_finalize(ctx);
+                return 1;
+            }
+            if (expect_ok(cairn_copy_tensor_bytes(ctx, "input_tokens", 0, staged_token, sizeof(staged_token)),
+                          "cairn_copy_tensor_bytes_wrap_first",
+                          ctx)) {
+                cairn_finalize(ctx);
+                return 1;
+            }
+            if (read_u32_le(staged_token) != 14) {
+                fprintf(stderr, "explicit staging did not overwrite input tensor with the requested batch cursor\n");
+                cairn_finalize(ctx);
+                return 1;
+            }
         }
     }
     if (expect_ok(cairn_train_step(ctx, &batch), "cairn_train_step", ctx)) {
         cairn_finalize(ctx);
         return 1;
+    }
+    if (argc == 6 && cairn_host_arena_allocated(ctx)) {
+        if (expect_ok(cairn_copy_tensor_bytes(ctx, "input_tokens", 0, staged_token, sizeof(staged_token)),
+                      "cairn_copy_tensor_bytes_after_train",
+                      ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (read_u32_le(staged_token) != 0) {
+            fprintf(stderr, "train step did not stage the current batch into input tensor\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
     }
     if (expect_ok(cairn_get_stats(ctx, &stats), "cairn_get_stats", ctx)) {
         cairn_finalize(ctx);

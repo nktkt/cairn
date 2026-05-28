@@ -97,7 +97,7 @@ cc -std=c11 -Wall -Wextra -Werror \
 ```
 
 The smoke binary also accepts an optional dataset manifest after `TRACE_OUT`. The manifest must use `format: fixed-token-binary`; relative shard paths are resolved from the manifest directory and checked against the declared token count and token dtype.
-When a dataset is loaded, the runtime resolves each batch to a shard cursor, `cairn_read_batch_tokens` can read token bytes across shard boundaries with wraparound, and `cairn_stage_batch_input` can stage the batch into the plan's `input_tokens` tensor when the host arena is allocated.
+When a dataset is loaded, the runtime resolves each batch to a shard cursor, `cairn_read_batch_tokens` can read token bytes across shard boundaries with wraparound, and `cairn_stage_batch_input` can stage the batch into the plan's `input_tokens` tensor when the host arena is allocated. `cairn_train_step` performs that staging automatically in host-arena smoke runs.
 
 The restore smoke binary verifies that a checkpoint root can be restored through `latest.json`:
 

@@ -2501,6 +2501,7 @@ static int execute_dependency_plan(cairn_context_t *ctx) {
 
 int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch) {
     uint64_t input_token_count;
+    int stage_status;
 
     if (ctx == NULL || batch == NULL) {
         return CAIRN_ERR_INVALID_ARGUMENT;
@@ -2520,6 +2521,12 @@ int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch) {
     input_token_count = plan_input_token_count(ctx);
     if (input_token_count == 0) {
         return set_error(ctx, CAIRN_ERR_PLAN, "plan input token count is invalid");
+    }
+    if (ctx->dataset_loaded && ctx->arena_allocated && find_tensor_by_name(ctx, "input_tokens") != NULL) {
+        stage_status = cairn_stage_batch_input(ctx, batch, NULL);
+        if (stage_status != CAIRN_OK) {
+            return stage_status;
+        }
     }
 
     ctx->trace_count = 0;
