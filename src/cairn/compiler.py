@@ -37,7 +37,7 @@ DTYPE_IDS = {
 }
 
 BINARY_PLAN_MAGIC = b"CAIRNPLN"
-BINARY_PLAN_VERSION = 2
+BINARY_PLAN_VERSION = 3
 BINARY_PLAN_HEADER = struct.Struct("<8sII64s64sIIIIIIIIQQ")
 BINARY_PLAN_SEGMENT = struct.Struct("<64sQQ")
 BINARY_PLAN_TENSOR = struct.Struct("<II64s64sQQI4Q")
@@ -314,9 +314,12 @@ def build_tensor_table(
     token_dtype = (dataset or {}).get("token_dtype", "uint32")
     input_token_count = training["microbatch_size"] * model["sequence_length"]
     input_nbytes = input_token_count * dtype_size_bytes(token_dtype)
+    input_nbytes_aligned = align(input_nbytes, 256)
     activation_nbytes = align(activation_bytes(model, training), 256)
     activation_segment = segments["activation_ring"]
-    activation_slots = max(1, min(2, activation_segment["nbytes"] // activation_nbytes))
+    if input_nbytes_aligned >= activation_segment["nbytes"]:
+        raise ValueError("input_tokens does not fit in activation_ring segment")
+    activation_slots = max(1, min(2, (activation_segment["nbytes"] - input_nbytes_aligned) // activation_nbytes))
 
     add_tensor(
         "params_shard",
@@ -359,7 +362,7 @@ def build_tensor_table(
             f"activation_slot_{slot}",
             "activation",
             "activation_ring",
-            slot * activation_nbytes,
+            input_nbytes_aligned + (slot * activation_nbytes),
             activation_nbytes,
             precision,
             [training["microbatch_size"], model["sequence_length"], model["hidden_size"]],

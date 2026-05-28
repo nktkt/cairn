@@ -12,12 +12,13 @@
 #define CAIRN_PATH_MAX 1024
 #define CAIRN_BINARY_PLAN_MAGIC "CAIRNPLN"
 #define CAIRN_BINARY_PLAN_MAGIC_SIZE 8
-#define CAIRN_BINARY_PLAN_VERSION 2
+#define CAIRN_BINARY_PLAN_VERSION 3
 #define CAIRN_BINARY_PLAN_HEADER_SIZE 192
 #define CAIRN_BINARY_PLAN_SEGMENT_SIZE 80
 #define CAIRN_BINARY_PLAN_TENSOR_SIZE 188
 #define CAIRN_BINARY_PLAN_OP_SIZE 124
 #define CAIRN_BINARY_PLAN_REF_SIZE 4
+#define CAIRN_MAX_OP_TENSOR_REFS 8
 
 typedef struct {
     uint64_t op_id;
@@ -1143,7 +1144,7 @@ static int reserve_arena(cairn_context_t *ctx, uint64_t arena_bytes) {
         if ((uint64_t)((size_t)arena_bytes) != arena_bytes) {
             return 0;
         }
-        ctx->arena = malloc((size_t)arena_bytes);
+        ctx->arena = calloc((size_t)arena_bytes, 1);
         if (ctx->arena == NULL) {
             return 0;
         }
@@ -2405,6 +2406,118 @@ static void record_trace_event(
     snprintf(event->stream, sizeof(event->stream), "%s", op->stream);
 }
 
+static uint32_t hash_op_seed(const cairn_context_t *ctx, const cairn_plan_op_t *op, uint32_t output_index) {
+    const unsigned char *cursor;
+    uint32_t hash;
+
+    hash = 2166136261u;
+    if (ctx != NULL) {
+        hash ^= (uint32_t)(ctx->step & 0xffffffffu);
+        hash *= 16777619u;
+        hash ^= ctx->desc.global_rank;
+        hash *= 16777619u;
+    }
+    if (op != NULL) {
+        hash ^= (uint32_t)(op->op_id & 0xffffffffu);
+        hash *= 16777619u;
+        for (cursor = (const unsigned char *)op->kind; *cursor != '\0'; cursor++) {
+            hash ^= (uint32_t)*cursor;
+            hash *= 16777619u;
+        }
+    }
+    hash ^= output_index;
+    hash *= 16777619u;
+    return hash == 0 ? 1u : hash;
+}
+
+static int tensor_from_ref(
+    const cairn_context_t *ctx,
+    uint32_t first,
+    uint32_t count,
+    uint32_t index,
+    const cairn_tensor_t **out
+) {
+    uint32_t ref_index;
+    uint32_t tensor_id;
+
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (ctx == NULL || out == NULL || index >= count || first > ctx->tensor_ref_count || count > ctx->tensor_ref_count - first) {
+        return 0;
+    }
+    ref_index = first + index;
+    tensor_id = ctx->tensor_refs[ref_index];
+    if (tensor_id >= ctx->tensor_count) {
+        return 0;
+    }
+    *out = &ctx->tensors[tensor_id];
+    return 1;
+}
+
+static int execute_host_tensor_effect(cairn_context_t *ctx, const cairn_plan_op_t *op) {
+    unsigned char *sources[CAIRN_MAX_OP_TENSOR_REFS];
+    uint64_t source_sizes[CAIRN_MAX_OP_TENSOR_REFS];
+    uint32_t input_index;
+    uint32_t output_index;
+
+    if (ctx == NULL || op == NULL || !ctx->arena_allocated || ctx->arena == NULL) {
+        return 1;
+    }
+    if (ctx->tensors == NULL || ctx->tensor_refs == NULL || op->output_count == 0) {
+        return 1;
+    }
+    if (op->input_count > CAIRN_MAX_OP_TENSOR_REFS || op->output_count > CAIRN_MAX_OP_TENSOR_REFS) {
+        set_error(ctx, CAIRN_ERR_PLAN, "op tensor reference count exceeds runtime executor limit");
+        return 0;
+    }
+
+    for (input_index = 0; input_index < op->input_count; input_index++) {
+        const cairn_tensor_t *input_tensor;
+
+        if (!tensor_from_ref(ctx, op->input_first, op->input_count, input_index, &input_tensor)) {
+            set_error(ctx, CAIRN_ERR_PLAN, "op input tensor reference is invalid");
+            return 0;
+        }
+        if (!tensor_arena_range(ctx, input_tensor, 0, input_tensor->nbytes, &sources[input_index])) {
+            set_error(ctx, CAIRN_ERR_STATE, "op input tensor is outside host arena");
+            return 0;
+        }
+        source_sizes[input_index] = input_tensor->nbytes;
+    }
+
+    for (output_index = 0; output_index < op->output_count; output_index++) {
+        const cairn_tensor_t *output_tensor;
+        unsigned char *destination;
+        uint64_t byte_index;
+        uint32_t seed;
+
+        if (!tensor_from_ref(ctx, op->output_first, op->output_count, output_index, &output_tensor)) {
+            set_error(ctx, CAIRN_ERR_PLAN, "op output tensor reference is invalid");
+            return 0;
+        }
+        if (!tensor_arena_range(ctx, output_tensor, 0, output_tensor->nbytes, &destination)) {
+            set_error(ctx, CAIRN_ERR_STATE, "op output tensor is outside host arena");
+            return 0;
+        }
+
+        seed = hash_op_seed(ctx, op, output_index);
+        for (byte_index = 0; byte_index < output_tensor->nbytes; byte_index++) {
+            uint32_t mixed = seed ^ (uint32_t)(byte_index * 131u) ^ (uint32_t)(byte_index >> 8);
+
+            for (input_index = 0; input_index < op->input_count; input_index++) {
+                uint64_t source_index = (byte_index + ((uint64_t)input_index * 257u) + seed) % source_sizes[input_index];
+
+                mixed ^= (uint32_t)sources[input_index][(size_t)source_index] << ((input_index % 4u) * 8u);
+                mixed = (mixed << 5) | (mixed >> 27);
+                mixed *= 16777619u;
+            }
+            destination[(size_t)byte_index] = (unsigned char)(mixed ^ (mixed >> 8) ^ (mixed >> 16) ^ (mixed >> 24));
+        }
+    }
+    return 1;
+}
+
 static int op_dependencies_ready(const cairn_context_t *ctx, uint64_t op_index, uint64_t *logical_start) {
     const cairn_plan_op_t *op;
     uint32_t dep_index;
@@ -2440,6 +2553,9 @@ static int execute_op(cairn_context_t *ctx, uint64_t op_index, uint64_t ordinal,
 
     op = &ctx->ops[op_index];
     logical_end = logical_start + 1;
+    if (!execute_host_tensor_effect(ctx, op)) {
+        return 0;
+    }
     update_stats_for_op(ctx, op);
     if (ctx->op_logical_end != NULL) {
         ctx->op_logical_end[op_index] = logical_end;

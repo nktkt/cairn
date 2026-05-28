@@ -133,7 +133,12 @@ class CompileTests(unittest.TestCase):
             self.assertLessEqual(kinds, supported_op_kinds())
             self.assertTrue(all("op_class" in op for op in rank_plan["ops"]))
             self.assertTrue(binary_plan.exists())
-            self.assertTrue(any(tensor["name"] == "input_tokens" for tensor in rank_plan["tensors"]))
+            tensors_by_name = {tensor["name"]: tensor for tensor in rank_plan["tensors"]}
+            self.assertIn("input_tokens", tensors_by_name)
+            self.assertIn("activation_slot_0", tensors_by_name)
+            input_tokens = tensors_by_name["input_tokens"]
+            activation_slot = tensors_by_name["activation_slot_0"]
+            self.assertLessEqual(input_tokens["offset"] + input_tokens["nbytes"], activation_slot["offset"])
             binary_header = BINARY_PLAN_HEADER.unpack(binary_plan.read_bytes()[: BINARY_PLAN_HEADER.size])
             (
                 magic,

@@ -219,6 +219,28 @@ int main(int argc, char **argv) {
             cairn_finalize(ctx);
             return 1;
         }
+        if (expect_ok(cairn_copy_tensor_bytes(ctx, "activation_slot_0", 0, staged_token, sizeof(staged_token)),
+                      "cairn_copy_tensor_bytes_activation",
+                      ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (read_u32_le(staged_token) == 0) {
+            fprintf(stderr, "host tensor executor did not mutate activation tensor\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (expect_ok(cairn_copy_tensor_bytes(ctx, "gradients_shard", 0, staged_token, sizeof(staged_token)),
+                      "cairn_copy_tensor_bytes_gradients",
+                      ctx)) {
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (read_u32_le(staged_token) == 0) {
+            fprintf(stderr, "host tensor executor did not mutate gradient tensor\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
     }
     if (expect_ok(cairn_get_stats(ctx, &stats), "cairn_get_stats", ctx)) {
         cairn_finalize(ctx);
