@@ -38,6 +38,7 @@ The current implementation includes:
 - `cairn compile` for deterministic static plan generation
 - `cairn simulate` for pipeline, memory, communication, checkpoint, and failure-injection reports
 - `cairn report` for compact report summaries
+- a C ABI/runtime skeleton under [runtime](runtime)
 - small example specs under [examples/small](examples/small)
 - unit tests and GitHub Actions CI
 
@@ -78,6 +79,18 @@ PYTHONPATH=src python -m cairn simulate build/plan \
 PYTHONPATH=src python -m cairn report build/simulation-report.json
 ```
 
+Build and run the C runtime smoke binary:
+
+```bash
+cc -std=c11 -Wall -Wextra -Werror \
+  -I runtime/include \
+  runtime/src/cairn.c \
+  runtime/examples/smoke.c \
+  -o /tmp/cairn-runtime-smoke
+
+/tmp/cairn-runtime-smoke build/plan/manifest.json
+```
+
 ## What Is Included
 
 The design covers:
@@ -109,7 +122,7 @@ See the long-horizon product roadmap here:
 
 ## Scope
 
-This is a planner and design repository, not a GPU training runtime yet. The next practical implementation milestone is a single-GPU C trainer with a static memory arena, fixed model math, checkpoint support, and trace output. Distributed execution should only follow after correctness is established against a reference implementation.
+This is a planner with a C runtime skeleton, not a GPU training runtime yet. The next practical implementation milestone is a single-GPU C trainer with a static memory arena, fixed model math, checkpoint support, and trace output. Distributed execution should only follow after correctness is established against a reference implementation.
 
 ## License
 

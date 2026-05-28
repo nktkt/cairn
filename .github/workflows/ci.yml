@@ -15,6 +15,13 @@ jobs:
           python-version: "3.12"
       - name: Run unit tests
         run: PYTHONPATH=src python -m unittest discover -s tests -v
+      - name: Build runtime smoke binary
+        run: >-
+          cc -std=c11 -Wall -Wextra -Werror
+          -I runtime/include
+          runtime/src/cairn.c
+          runtime/examples/smoke.c
+          -o /tmp/cairn-runtime-smoke
       - name: Validate example bundle
         run: >-
           PYTHONPATH=src python -m cairn validate
@@ -34,3 +41,4 @@ jobs:
             --out build/plan
           PYTHONPATH=src python -m cairn simulate build/plan --out build/simulation-report.json
           PYTHONPATH=src python -m cairn report build/simulation-report.json
+          /tmp/cairn-runtime-smoke build/plan/manifest.json
