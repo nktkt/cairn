@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "kind": "dataset",
+  "required": {
+    "version": "integer",
+    "name": "string",
+    "shards": "non-empty-list"
+  },
+  "shard": {
+    "path": "string",
+    "tokens": "integer>=1"
+  }
+}

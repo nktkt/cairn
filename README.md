@@ -1,8 +1,8 @@
 # Cairn
 
-This repository contains a design draft for a C-based, fixed-shape AI training stack intended for very large GPU clusters.
+This repository contains an early implementation and design draft for a C-based, fixed-shape AI training stack intended for very large GPU clusters.
 
-The project does not run frontier-scale training. Instead, it documents how to build a specialized training runtime that treats a known model, known tensor shapes, and a known cluster topology as a static execution target.
+The project does not run frontier-scale training yet. Today it provides a deterministic planning CLI that validates fixed training specs, maps ranks onto a topology, compiles inspectable per-rank plan artifacts, and simulates the resulting schedule.
 
 ## Core Idea
 
@@ -28,6 +28,55 @@ The design is centered on two components:
 2. A thin C runtime that executes those plans using static memory arenas, CUDA Graphs, cuBLASLt, cuDNN, NCCL, NVSHMEM, checkpoint I/O, and telemetry.
 
 The runtime should not infer graph structure, allocate memory, compile kernels, or choose communication groups during steady-state training.
+
+## Current Implementation
+
+The current implementation includes:
+
+- `cairn validate` for model, training, topology, dataset, and checkpoint specs
+- `cairn map` for deterministic physical/logical rank mapping
+- `cairn compile` for deterministic static plan generation
+- `cairn simulate` for pipeline, memory, communication, checkpoint, and failure-injection reports
+- `cairn report` for compact report summaries
+- small example specs under [examples/small](examples/small)
+- unit tests and GitHub Actions CI
+
+## Quick Start
+
+Run the test suite:
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+Validate the example bundle:
+
+```bash
+PYTHONPATH=src python -m cairn validate \
+  --model examples/small/model.json \
+  --training examples/small/training.json \
+  --topology examples/small/topology.json \
+  --dataset examples/small/dataset.json \
+  --checkpoint examples/small/checkpoint.json
+```
+
+Compile and simulate a plan:
+
+```bash
+PYTHONPATH=src python -m cairn compile \
+  --model examples/small/model.json \
+  --training examples/small/training.json \
+  --topology examples/small/topology.json \
+  --dataset examples/small/dataset.json \
+  --checkpoint examples/small/checkpoint.json \
+  --out build/plan
+
+PYTHONPATH=src python -m cairn simulate build/plan \
+  --failure rank:3 \
+  --out build/simulation-report.json
+
+PYTHONPATH=src python -m cairn report build/simulation-report.json
+```
 
 ## What Is Included
 
@@ -60,8 +109,8 @@ See the long-horizon product roadmap here:
 
 ## Scope
 
-This is a design repository, not a runnable trainer. The first practical implementation milestone would be a single-GPU C trainer with a static memory arena, fixed model math, checkpoint support, and trace output. Distributed execution should only follow after correctness is established against a reference implementation.
+This is a planner and design repository, not a GPU training runtime yet. The next practical implementation milestone is a single-GPU C trainer with a static memory arena, fixed model math, checkpoint support, and trace output. Distributed execution should only follow after correctness is established against a reference implementation.
 
 ## License
 
-No license has been selected yet.
+MIT. See [LICENSE](LICENSE).

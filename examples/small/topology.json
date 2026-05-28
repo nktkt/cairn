@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "name": "small-8-gpu-local",
+  "rails": 2,
+  "racks": [
+    {
+      "id": "rack0",
+      "trays": [
+        {
+          "id": "tray0",
+          "gpus": 4
+        },
+        {
+          "id": "tray1",
+          "gpus": 4
+        }
+      ]
+    }
+  ]
+}

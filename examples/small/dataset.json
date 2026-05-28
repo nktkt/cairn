@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "name": "synthetic-token-shards",
+  "format": "fixed-token-binary",
+  "shards": [
+    {
+      "path": "data/shard_000000.bin",
+      "tokens": 1048576
+    },
+    {
+      "path": "data/shard_000001.bin",
+      "tokens": 1048576
+    }
+  ]
+}

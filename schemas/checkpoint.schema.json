@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "kind": "checkpoint",
+  "required": {
+    "version": "integer",
+    "interval_steps": "integer>=1",
+    "local_path": "string"
+  },
+  "optional": {
+    "remote_path": "string"
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "kind": "topology",
+  "required": {
+    "version": "integer",
+    "name": "string",
+    "rails": "integer>=1",
+    "racks": "non-empty-list"
+  },
+  "rack": {
+    "id": "string",
+    "trays": "non-empty-list"
+  },
+  "tray": {
+    "id": "string",
+    "gpus": "integer>=1"
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "interval_steps": 100,
+  "local_path": "runs/small/checkpoints",
+  "remote_path": ""
+}

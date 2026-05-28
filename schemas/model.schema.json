@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "kind": "model",
+  "required": {
+    "version": "integer",
+    "family": "string:gpt",
+    "layers": "integer>=1",
+    "hidden_size": "integer>=1",
+    "attention_heads": "integer>=1",
+    "sequence_length": "integer>=1",
+    "vocab_size": "integer>=1",
+    "ffn_hidden_size": "integer>=1"
+  }
+}

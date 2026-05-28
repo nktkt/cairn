@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "kind": "training",
+  "required": {
+    "version": "integer",
+    "precision": "enum:bf16,fp16,fp8",
+    "microbatch_size": "integer>=1",
+    "gradient_accumulation_steps": "integer>=1",
+    "memory_budget_bytes_per_gpu": "integer>=1024",
+    "optimizer": "object",
+    "parallelism": "object"
+  },
+  "parallelism": {
+    "tensor": "integer>=1",
+    "pipeline": "integer>=1",
+    "data": "integer>=1",
+    "sequence": "integer>=1",
+    "context": "integer>=1",
+    "expert": "integer>=1"
+  }
+}
