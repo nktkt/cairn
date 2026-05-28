@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import json
 from pathlib import Path
 
 from cairn.compiler import compile_plan
@@ -65,10 +66,13 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(run_result.returncode, 0, run_result.stderr)
             self.assertIn("cairn runtime smoke ok", run_result.stdout)
             self.assertIn("ops=17", run_result.stdout)
+            self.assertIn("segments=7", run_result.stdout)
             self.assertTrue(checkpoint.exists())
             checkpoint_data = load_json(checkpoint)
             self.assertEqual(checkpoint_data["step"], 1)
             self.assertEqual(checkpoint_data["ops_executed"], 17)
+            self.assertEqual(checkpoint_data["memory_segment_count"], 7)
+            self.assertGreaterEqual(checkpoint_data["arena_bytes"], checkpoint_data["estimated_memory_bytes"])
             self.assertGreater(checkpoint_data["communication_bytes"], 0)
             self.assertGreater(checkpoint_data["io_bytes"], 0)
 
@@ -81,6 +85,20 @@ class RuntimeSmokeTests(unittest.TestCase):
             )
             self.assertNotEqual(mismatch_result.returncode, 0)
             self.assertIn("world_size does not match", mismatch_result.stderr)
+
+            bad_plan = temp_path / "bad-rank-plan.json"
+            bad_plan_data = load_json(plan_dir / "ranks" / "rank_000000.json")
+            bad_plan_data["memory"]["segments"][1]["offset"] = 1
+            bad_plan.write_text(json.dumps(bad_plan_data, indent=2, sort_keys=True), encoding="utf-8")
+            bad_memory_result = subprocess.run(
+                [str(binary), str(bad_plan), "8", str(temp_path / "bad-memory-checkpoint.json")],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(bad_memory_result.returncode, 0)
+            self.assertIn("memory segments", bad_memory_result.stderr)
 
 
 if __name__ == "__main__":

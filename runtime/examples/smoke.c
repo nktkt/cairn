@@ -20,6 +20,8 @@ int main(int argc, char **argv) {
     char plan_id[65];
     unsigned long long op_count;
     unsigned long long memory_bytes;
+    unsigned long long segment_count;
+    unsigned long long arena_bytes;
 
     if (argc != 4) {
         fprintf(stderr, "usage: %s RANK_PLAN WORLD_SIZE CHECKPOINT_OUT\n", argv[0]);
@@ -52,6 +54,11 @@ int main(int argc, char **argv) {
     }
     if (cairn_plan_memory_bytes(ctx) == 0) {
         fprintf(stderr, "rank plan has no memory estimate\n");
+        cairn_finalize(ctx);
+        return 1;
+    }
+    if (cairn_memory_segment_count(ctx) == 0 || cairn_memory_arena_bytes(ctx) == 0) {
+        fprintf(stderr, "rank plan has no memory arena metadata\n");
         cairn_finalize(ctx);
         return 1;
     }
@@ -89,6 +96,8 @@ int main(int argc, char **argv) {
     snprintf(plan_id, sizeof(plan_id), "%s", cairn_plan_id(ctx));
     op_count = (unsigned long long)cairn_plan_op_count(ctx);
     memory_bytes = (unsigned long long)cairn_plan_memory_bytes(ctx);
+    segment_count = (unsigned long long)cairn_memory_segment_count(ctx);
+    arena_bytes = (unsigned long long)cairn_memory_arena_bytes(ctx);
     if (expect_ok(cairn_finalize(ctx), "cairn_finalize", ctx)) {
         return 1;
     }
@@ -113,9 +122,11 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("cairn runtime smoke ok plan=%s ops=%llu memory=%llu\n",
+    printf("cairn runtime smoke ok plan=%s ops=%llu memory=%llu segments=%llu arena=%llu\n",
            plan_id,
            op_count,
-           memory_bytes);
+           memory_bytes,
+           segment_count,
+           arena_bytes);
     return 0;
 }

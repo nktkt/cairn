@@ -12,6 +12,12 @@ typedef struct {
     char stream[32];
 } cairn_plan_op_t;
 
+typedef struct {
+    uint64_t offset;
+    uint64_t nbytes;
+    char name[64];
+} cairn_memory_segment_t;
+
 struct cairn_context {
     cairn_init_desc_t desc;
     char last_error[256];
@@ -24,6 +30,11 @@ struct cairn_context {
     uint32_t plan_rank;
     uint32_t plan_microbatch_size;
     cairn_plan_op_t *ops;
+    cairn_memory_segment_t *segments;
+    uint64_t segment_count;
+    uint64_t arena_bytes;
+    void *arena;
+    int arena_allocated;
     cairn_runtime_stats_t stats;
     int plan_loaded;
     int checkpoint_loaded;
@@ -175,18 +186,18 @@ static int parse_json_u64(const char *json, const char *key, uint64_t *out) {
     return 1;
 }
 
-static uint64_t count_occurrences(const char *text, const char *needle) {
+static uint64_t count_occurrences_range(const char *text, const char *end, const char *needle) {
     uint64_t count;
     size_t needle_len;
     const char *cursor;
 
-    if (text == NULL || needle == NULL || needle[0] == '\0') {
+    if (text == NULL || end == NULL || end < text || needle == NULL || needle[0] == '\0') {
         return 0;
     }
     count = 0;
     needle_len = strlen(needle);
     cursor = text;
-    while ((cursor = strstr(cursor, needle)) != NULL) {
+    while ((cursor = strstr(cursor, needle)) != NULL && cursor < end) {
         count++;
         cursor += needle_len;
     }
@@ -232,14 +243,14 @@ static const char *find_matching_bracket(const char *open) {
     return NULL;
 }
 
-static const char *find_ops_array(const char *json, const char **out_end) {
+static const char *find_json_array(const char *json, const char *key, const char **out_end) {
     const char *cursor;
     const char *end;
 
     if (out_end != NULL) {
         *out_end = NULL;
     }
-    cursor = find_json_key(json, "ops");
+    cursor = find_json_key(json, key);
     if (cursor == NULL) {
         return NULL;
     }
@@ -262,6 +273,10 @@ static const char *find_ops_array(const char *json, const char **out_end) {
         *out_end = end;
     }
     return cursor + 1;
+}
+
+static const char *find_ops_array(const char *json, const char **out_end) {
+    return find_json_array(json, "ops", out_end);
 }
 
 static const char *reverse_find_char(const char *start, const char *cursor, char needle) {
@@ -319,7 +334,7 @@ static int parse_op_table(const char *json, cairn_plan_op_t **out_ops, uint64_t 
         return 0;
     }
 
-    count = count_occurrences(ops_start, "\"op_id\"");
+    count = count_occurrences_range(ops_start, ops_end, "\"op_id\"");
     if (count == 0) {
         return 0;
     }
@@ -389,6 +404,142 @@ static int parse_op_table(const char *json, cairn_plan_op_t **out_ops, uint64_t 
     return 1;
 }
 
+static int parse_memory_segments(
+    const char *json,
+    cairn_memory_segment_t **out_segments,
+    uint64_t *out_count,
+    uint64_t *out_arena_bytes
+) {
+    const char *segments_start;
+    const char *segments_end;
+    const char *cursor;
+    uint64_t count;
+    uint64_t index;
+    uint64_t previous_end;
+    uint64_t arena_bytes;
+    cairn_memory_segment_t *segments;
+
+    if (out_segments == NULL || out_count == NULL || out_arena_bytes == NULL) {
+        return 0;
+    }
+    *out_segments = NULL;
+    *out_count = 0;
+    *out_arena_bytes = 0;
+
+    segments_start = find_json_array(json, "segments", &segments_end);
+    if (segments_start == NULL || segments_end == NULL || segments_end <= segments_start) {
+        return 0;
+    }
+
+    count = count_occurrences_range(segments_start, segments_end, "\"name\"");
+    if (count == 0) {
+        return 0;
+    }
+    segments = (cairn_memory_segment_t *)calloc((size_t)count, sizeof(cairn_memory_segment_t));
+    if (segments == NULL) {
+        return 0;
+    }
+
+    cursor = segments_start;
+    index = 0;
+    previous_end = 0;
+    arena_bytes = 0;
+    while ((cursor = strstr(cursor, "\"name\"")) != NULL && cursor < segments_end) {
+        const char *object_start;
+        const char *object_end;
+        char *object_json;
+        uint64_t offset;
+        uint64_t nbytes;
+
+        if (index >= count) {
+            free(segments);
+            return 0;
+        }
+
+        object_start = reverse_find_char(segments_start, cursor, '{');
+        object_end = strchr(cursor, '}');
+        if (object_start == NULL || object_end == NULL || object_end > segments_end) {
+            free(segments);
+            return 0;
+        }
+        object_json = copy_range(object_start, object_end);
+        if (object_json == NULL) {
+            free(segments);
+            return 0;
+        }
+
+        if (!parse_json_string(object_json, "name", segments[index].name, sizeof(segments[index].name))) {
+            free(object_json);
+            free(segments);
+            return 0;
+        }
+        if (!parse_json_u64(object_json, "offset", &offset)) {
+            free(object_json);
+            free(segments);
+            return 0;
+        }
+        if (!parse_json_u64(object_json, "nbytes", &nbytes) || nbytes == 0) {
+            free(object_json);
+            free(segments);
+            return 0;
+        }
+        if (offset < previous_end || UINT64_MAX - offset < nbytes) {
+            free(object_json);
+            free(segments);
+            return 0;
+        }
+
+        segments[index].offset = offset;
+        segments[index].nbytes = nbytes;
+        previous_end = offset + nbytes;
+        if (previous_end > arena_bytes) {
+            arena_bytes = previous_end;
+        }
+
+        free(object_json);
+        index++;
+        cursor = object_end + 1;
+    }
+
+    if (index != count || arena_bytes == 0) {
+        free(segments);
+        return 0;
+    }
+
+    *out_segments = segments;
+    *out_count = count;
+    *out_arena_bytes = arena_bytes;
+    return 1;
+}
+
+static int reserve_arena(cairn_context_t *ctx, uint64_t arena_bytes) {
+    const char *allocate_host_arena;
+
+    if (ctx == NULL || arena_bytes == 0) {
+        return 0;
+    }
+
+    allocate_host_arena = getenv("CAIRN_ALLOCATE_HOST_ARENA");
+    if (allocate_host_arena != NULL && strcmp(allocate_host_arena, "1") == 0) {
+        if ((uint64_t)((size_t)arena_bytes) != arena_bytes) {
+            return 0;
+        }
+        ctx->arena = malloc((size_t)arena_bytes);
+        if (ctx->arena == NULL) {
+            return 0;
+        }
+        ctx->arena_allocated = 1;
+    } else {
+        ctx->arena = malloc(1);
+        if (ctx->arena == NULL) {
+            return 0;
+        }
+        ctx->arena_allocated = 0;
+    }
+    ctx->arena_bytes = arena_bytes;
+    return 1;
+}
+
 static int stream_is_comm(const char *stream) {
     return stream != NULL && strncmp(stream, "comm_", 5) == 0;
 }
@@ -403,8 +554,15 @@ static void clear_plan(cairn_context_t *ctx) {
     }
     free(ctx->ops);
     ctx->ops = NULL;
+    free(ctx->segments);
+    ctx->segments = NULL;
+    free(ctx->arena);
+    ctx->arena = NULL;
     ctx->op_count = 0;
+    ctx->segment_count = 0;
     ctx->estimated_memory_bytes = 0;
+    ctx->arena_bytes = 0;
+    ctx->arena_allocated = 0;
     ctx->plan_world_size = 0;
     ctx->plan_rank = 0;
     ctx->plan_microbatch_size = 1;
@@ -438,6 +596,11 @@ int cairn_init(cairn_context_t **ctx, const cairn_init_desc_t *desc) {
     created->plan_rank = 0;
     created->plan_microbatch_size = 1;
     created->ops = NULL;
+    created->segments = NULL;
+    created->segment_count = 0;
+    created->arena_bytes = 0;
+    created->arena = NULL;
+    created->arena_allocated = 0;
     memset(&created->stats, 0, sizeof(created->stats));
     created->plan_loaded = 0;
     created->checkpoint_loaded = 0;
@@ -457,7 +620,10 @@ int cairn_load_plan(cairn_context_t *ctx, const char *path) {
     uint32_t loaded_microbatch_size;
     uint64_t loaded_memory_bytes;
     uint64_t loaded_op_count;
+    uint64_t loaded_segment_count;
+    uint64_t loaded_arena_bytes;
     cairn_plan_op_t *loaded_ops;
+    cairn_memory_segment_t *loaded_segments;
 
     if (ctx == NULL || path == NULL) {
         return CAIRN_ERR_INVALID_ARGUMENT;
@@ -480,7 +646,10 @@ int cairn_load_plan(cairn_context_t *ctx, const char *path) {
     loaded_microbatch_size = 1;
     loaded_memory_bytes = 0;
     loaded_op_count = 0;
+    loaded_segment_count = 0;
+    loaded_arena_bytes = 0;
     loaded_ops = NULL;
+    loaded_segments = NULL;
 
     if (!parse_json_string(contents, "plan_id", loaded_plan_id, sizeof(loaded_plan_id))) {
         free(contents);
@@ -522,6 +691,11 @@ int cairn_load_plan(cairn_context_t *ctx, const char *path) {
         free(contents);
         return set_error(ctx, CAIRN_ERR_PLAN, "plan op table is missing or invalid");
     }
+    if (!parse_memory_segments(contents, &loaded_segments, &loaded_segment_count, &loaded_arena_bytes)) {
+        free(loaded_ops);
+        free(contents);
+        return set_error(ctx, CAIRN_ERR_PLAN, "plan memory segments are missing or invalid");
+    }
     free(contents);
 
     clear_plan(ctx);
@@ -532,6 +706,12 @@ int cairn_load_plan(cairn_context_t *ctx, const char *path) {
     ctx->estimated_memory_bytes = loaded_memory_bytes;
     ctx->ops = loaded_ops;
     ctx->op_count = loaded_op_count;
+    ctx->segments = loaded_segments;
+    ctx->segment_count = loaded_segment_count;
+    if (!reserve_arena(ctx, loaded_arena_bytes)) {
+        clear_plan(ctx);
+        return set_error(ctx, CAIRN_ERR_STATE, "memory arena could not be reserved");
+    }
     ctx->plan_loaded = 1;
     return CAIRN_OK;
 }
@@ -671,6 +851,9 @@ int cairn_save_checkpoint(cairn_context_t *ctx, const char *tag) {
     fprintf(file, "  \"token_offset\": %llu,\n", (unsigned long long)ctx->token_offset);
     fprintf(file, "  \"op_count\": %llu,\n", (unsigned long long)ctx->op_count);
     fprintf(file, "  \"estimated_memory_bytes\": %llu,\n", (unsigned long long)ctx->estimated_memory_bytes);
+    fprintf(file, "  \"memory_segment_count\": %llu,\n", (unsigned long long)ctx->segment_count);
+    fprintf(file, "  \"arena_bytes\": %llu,\n", (unsigned long long)ctx->arena_bytes);
+    fprintf(file, "  \"arena_allocated\": %s,\n", ctx->arena_allocated ? "true" : "false");
     fprintf(file, "  \"ops_executed\": %llu,\n", (unsigned long long)ctx->stats.ops_executed);
     fprintf(file, "  \"communication_bytes\": %llu,\n", (unsigned long long)ctx->stats.communication_bytes);
     fprintf(file, "  \"io_bytes\": %llu\n", (unsigned long long)ctx->stats.io_bytes);
@@ -688,6 +871,10 @@ int cairn_finalize(cairn_context_t *ctx) {
     ctx->finalized = 1;
     free(ctx->ops);
     ctx->ops = NULL;
+    free(ctx->segments);
+    ctx->segments = NULL;
+    free(ctx->arena);
+    ctx->arena = NULL;
     free(ctx);
     return CAIRN_OK;
 }
@@ -718,6 +905,20 @@ uint64_t cairn_plan_memory_bytes(const cairn_context_t *ctx) {
         return 0;
     }
     return ctx->estimated_memory_bytes;
+}
+
+uint64_t cairn_memory_segment_count(const cairn_context_t *ctx) {
+    if (ctx == NULL) {
+        return 0;
+    }
+    return ctx->segment_count;
+}
+
+uint64_t cairn_memory_arena_bytes(const cairn_context_t *ctx) {
+    if (ctx == NULL) {
+        return 0;
+    }
+    return ctx->arena_bytes;
 }
 
 uint64_t cairn_current_step(const cairn_context_t *ctx) {
