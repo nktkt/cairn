@@ -38,7 +38,10 @@ int main(int argc, char **argv) {
     unsigned long long dataset_total_tokens;
     unsigned long long arena_bytes;
     unsigned char token_buffer[40];
+    unsigned char staged_token[4];
     uint64_t tokens_read;
+    uint64_t tokens_staged;
+    uint64_t input_token_count;
     int status;
 
     if (argc < 4 || argc > 6) {
@@ -137,6 +140,51 @@ int main(int argc, char **argv) {
             cairn_finalize(ctx);
             return 1;
         }
+        if (cairn_host_arena_allocated(ctx)) {
+            input_token_count = cairn_plan_input_token_count(ctx);
+            if (input_token_count == 0) {
+                fprintf(stderr, "plan input token count was not populated\n");
+                cairn_finalize(ctx);
+                return 1;
+            }
+            if (expect_ok(cairn_stage_batch_input(ctx, &batch, &tokens_staged), "cairn_stage_batch_input", ctx)) {
+                cairn_finalize(ctx);
+                return 1;
+            }
+            if (tokens_staged != input_token_count) {
+                fprintf(stderr, "staged input token count does not match plan input token count\n");
+                cairn_finalize(ctx);
+                return 1;
+            }
+            if (expect_ok(cairn_copy_tensor_bytes(ctx, "input_tokens", 0, staged_token, sizeof(staged_token)),
+                          "cairn_copy_tensor_bytes_first",
+                          ctx)) {
+                cairn_finalize(ctx);
+                return 1;
+            }
+            if (read_u32_le(staged_token) != 0) {
+                fprintf(stderr, "staged input tensor did not start with the batch cursor token\n");
+                cairn_finalize(ctx);
+                return 1;
+            }
+            if (expect_ok(
+                    cairn_copy_tensor_bytes(
+                        ctx,
+                        "input_tokens",
+                        (tokens_staged - 1) * sizeof(staged_token),
+                        staged_token,
+                        sizeof(staged_token)),
+                    "cairn_copy_tensor_bytes_last",
+                    ctx)) {
+                cairn_finalize(ctx);
+                return 1;
+            }
+            if (read_u32_le(staged_token) != 15) {
+                fprintf(stderr, "staged input tensor did not wrap through the dataset shards\n");
+                cairn_finalize(ctx);
+                return 1;
+            }
+        }
     }
     if (expect_ok(cairn_train_step(ctx, &batch), "cairn_train_step", ctx)) {
         cairn_finalize(ctx);
@@ -229,7 +277,7 @@ int main(int argc, char **argv) {
             cairn_finalize(ctx);
             return 1;
         }
-        if (tokens_read != 4 || read_u32_le(token_buffer) != 2 || read_u32_le(token_buffer + 12) != 5) {
+        if (tokens_read != 4 || read_u32_le(token_buffer) != 0 || read_u32_le(token_buffer + 12) != 3) {
             fprintf(stderr, "checkpoint restore did not recover readable dataset token cursor\n");
             cairn_finalize(ctx);
             return 1;

@@ -31,6 +31,9 @@ DTYPE_IDS = {
     "bf16": 2,
     "uint64": 3,
     "bytes": 4,
+    "uint32": 5,
+    "uint16": 6,
+    "uint8": 7,
 }
 
 BINARY_PLAN_MAGIC = b"CAIRNPLN"
@@ -129,6 +132,7 @@ def compile_plan(
             rank=rank,
             model=model,
             training=training,
+            dataset=dataset,
             layer_assignments=layer_assignments,
             memory=memory,
             op_registry=op_registry,
@@ -177,6 +181,7 @@ def build_rank_plan(
     rank: dict[str, Any],
     model: dict[str, Any],
     training: dict[str, Any],
+    dataset: dict[str, Any] | None,
     layer_assignments: list[dict[str, Any]],
     memory: dict[str, Any],
     op_registry: dict[str, Any],
@@ -186,7 +191,7 @@ def build_rank_plan(
     data = training["parallelism"]["data"]
     assignment = layer_assignments[pp]
     ops: list[dict[str, Any]] = []
-    tensors = build_tensor_table(model, training, memory)
+    tensors = build_tensor_table(model, training, memory, dataset)
     tensor_ids = {tensor["name"]: tensor["tensor_id"] for tensor in tensors}
 
     op_id = 0
@@ -269,7 +274,12 @@ def gradient_bytes(model: dict[str, Any], training: dict[str, Any]) -> int:
     return model["hidden_size"] * model["hidden_size"] * dtype_size // max(1, training["parallelism"]["tensor"])
 
 
-def build_tensor_table(model: dict[str, Any], training: dict[str, Any], memory: dict[str, Any]) -> list[dict[str, Any]]:
+def build_tensor_table(
+    model: dict[str, Any],
+    training: dict[str, Any],
+    memory: dict[str, Any],
+    dataset: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
     segments = {segment["name"]: segment for segment in memory["segments"]}
     tensors: list[dict[str, Any]] = []
 
@@ -301,6 +311,9 @@ def build_tensor_table(model: dict[str, Any], training: dict[str, Any], memory: 
         )
 
     precision = training["precision"]
+    token_dtype = (dataset or {}).get("token_dtype", "uint32")
+    input_token_count = training["microbatch_size"] * model["sequence_length"]
+    input_nbytes = input_token_count * dtype_size_bytes(token_dtype)
     activation_nbytes = align(activation_bytes(model, training), 256)
     activation_segment = segments["activation_ring"]
     activation_slots = max(1, min(2, activation_segment["nbytes"] // activation_nbytes))
@@ -331,6 +344,15 @@ def build_tensor_table(model: dict[str, Any], training: dict[str, Any], memory: 
         segments["optimizer_state_shard"]["nbytes"],
         "bf16",
         [segments["optimizer_state_shard"]["nbytes"] // dtype_size_bytes("bf16")],
+    )
+    add_tensor(
+        "input_tokens",
+        "input",
+        "activation_ring",
+        0,
+        input_nbytes,
+        token_dtype,
+        [training["microbatch_size"], model["sequence_length"]],
     )
     for slot in range(activation_slots):
         add_tensor(
@@ -378,6 +400,9 @@ def dtype_size_bytes(dtype: str) -> int:
         "bf16": 2,
         "uint64": 8,
         "bytes": 1,
+        "uint32": 4,
+        "uint16": 2,
+        "uint8": 1,
     }[dtype]
 
 

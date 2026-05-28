@@ -63,7 +63,7 @@ int main(int argc, char **argv) {
             cairn_finalize(ctx);
             return 1;
         }
-        if (batch.shard_path[0] == '\0' || batch.shard_index != 0 || batch.shard_token_offset != 2) {
+        if (batch.shard_path[0] == '\0' || batch.shard_index != 0 || batch.shard_token_offset != 0) {
             fprintf(stderr, "checkpoint restore did not recover dataset cursor\n");
             cairn_finalize(ctx);
             return 1;
@@ -75,7 +75,7 @@ int main(int argc, char **argv) {
             cairn_finalize(ctx);
             return 1;
         }
-        if (tokens_read != 4 || read_u32_le(token_buffer) != 2 || read_u32_le(token_buffer + 12) != 5) {
+        if (tokens_read != 4 || read_u32_le(token_buffer) != 0 || read_u32_le(token_buffer + 12) != 3) {
             fprintf(stderr, "checkpoint restore did not recover readable dataset token bytes\n");
             cairn_finalize(ctx);
             return 1;

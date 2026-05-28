@@ -79,6 +79,14 @@ int cairn_read_batch_tokens(
     uint64_t out_nbytes,
     uint64_t *out_tokens_read
 );
+int cairn_stage_batch_input(cairn_context_t *ctx, const cairn_batch_t *batch, uint64_t *out_tokens_staged);
+int cairn_copy_tensor_bytes(
+    cairn_context_t *ctx,
+    const char *tensor_name,
+    uint64_t byte_offset,
+    void *out,
+    uint64_t out_nbytes
+);
 int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch);
 int cairn_get_stats(const cairn_context_t *ctx, cairn_runtime_stats_t *stats);
 uint64_t cairn_trace_event_count(const cairn_context_t *ctx);
@@ -96,6 +104,8 @@ uint64_t cairn_plan_tensor_count(const cairn_context_t *ctx);
 uint64_t cairn_plan_dependency_ref_count(const cairn_context_t *ctx);
 uint64_t cairn_plan_tensor_ref_count(const cairn_context_t *ctx);
 uint64_t cairn_memory_arena_bytes(const cairn_context_t *ctx);
+int cairn_host_arena_allocated(const cairn_context_t *ctx);
+uint64_t cairn_plan_input_token_count(const cairn_context_t *ctx);
 uint64_t cairn_dataset_shard_count(const cairn_context_t *ctx);
 uint64_t cairn_dataset_total_tokens(const cairn_context_t *ctx);
 uint32_t cairn_dataset_token_bytes(const cairn_context_t *ctx);

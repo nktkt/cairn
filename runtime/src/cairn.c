@@ -495,7 +495,105 @@ static const char *op_class_name(cairn_op_class_t op_class) {
 }
 
 static int dtype_id_is_valid(uint32_t dtype_id) {
-    return dtype_id >= 1 && dtype_id <= 4;
+    return dtype_id >= 1 && dtype_id <= 7;
+}
+
+static uint32_t dtype_id_size_bytes(uint32_t dtype_id) {
+    if (dtype_id == 1 || dtype_id == 4 || dtype_id == 7) {
+        return 1;
+    }
+    if (dtype_id == 2 || dtype_id == 6) {
+        return 2;
+    }
+    if (dtype_id == 5) {
+        return 4;
+    }
+    if (dtype_id == 3) {
+        return 8;
+    }
+    return 0;
+}
+
+static const cairn_tensor_t *find_tensor_by_name(const cairn_context_t *ctx, const char *name) {
+    uint64_t index;
+
+    if (ctx == NULL || name == NULL || name[0] == '\0' || ctx->tensors == NULL) {
+        return NULL;
+    }
+    for (index = 0; index < ctx->tensor_count; index++) {
+        if (strcmp(ctx->tensors[index].name, name) == 0) {
+            return &ctx->tensors[index];
+        }
+    }
+    return NULL;
+}
+
+static uint64_t plan_input_token_count(const cairn_context_t *ctx) {
+    const cairn_tensor_t *input_tokens;
+    uint32_t dtype_bytes;
+
+    if (ctx == NULL) {
+        return 0;
+    }
+    input_tokens = find_tensor_by_name(ctx, "input_tokens");
+    if (input_tokens == NULL) {
+        return ctx->plan_microbatch_size;
+    }
+    dtype_bytes = dtype_id_size_bytes(input_tokens->dtype_id);
+    if (dtype_bytes == 0 || input_tokens->nbytes == 0 || input_tokens->nbytes % dtype_bytes != 0) {
+        return 0;
+    }
+    return input_tokens->nbytes / dtype_bytes;
+}
+
+static int tensor_arena_range(
+    const cairn_context_t *ctx,
+    const cairn_tensor_t *tensor,
+    uint64_t byte_offset,
+    uint64_t nbytes,
+    unsigned char **out
+) {
+    uint64_t arena_offset;
+
+    if (out != NULL) {
+        *out = NULL;
+    }
+    if (ctx == NULL || tensor == NULL || out == NULL || ctx->arena == NULL || !ctx->arena_allocated) {
+        return 0;
+    }
+    if (byte_offset > tensor->nbytes || nbytes > tensor->nbytes - byte_offset) {
+        return 0;
+    }
+    if (UINT64_MAX - tensor->offset < byte_offset) {
+        return 0;
+    }
+    arena_offset = tensor->offset + byte_offset;
+    if (arena_offset > ctx->arena_bytes || nbytes > ctx->arena_bytes - arena_offset) {
+        return 0;
+    }
+    if ((uint64_t)((size_t)arena_offset) != arena_offset || (uint64_t)((size_t)nbytes) != nbytes) {
+        return 0;
+    }
+    *out = ((unsigned char *)ctx->arena) + (size_t)arena_offset;
+    return 1;
+}
+
+static void advance_token_offset(cairn_context_t *ctx, uint64_t token_count) {
+    if (ctx == NULL || token_count == 0) {
+        return;
+    }
+    if (ctx->dataset_loaded && ctx->dataset_total_tokens > 0) {
+        uint64_t cursor = ctx->token_offset % ctx->dataset_total_tokens;
+        uint64_t advance = token_count % ctx->dataset_total_tokens;
+
+        if (ctx->dataset_total_tokens - cursor <= advance) {
+            ctx->token_offset = advance - (ctx->dataset_total_tokens - cursor);
+        } else {
+            ctx->token_offset = cursor + advance;
+        }
+        return;
+    }
+    ctx->token_offset += token_count;
 }
 
 static int tensor_fits_segment(
@@ -2175,6 +2273,94 @@ int cairn_read_batch_tokens(
     return CAIRN_OK;
 }
 
+int cairn_stage_batch_input(cairn_context_t *ctx, const cairn_batch_t *batch, uint64_t *out_tokens_staged) {
+    const cairn_tensor_t *input_tokens;
+    unsigned char *destination;
+    uint64_t token_count;
+    uint64_t tokens_read;
+    uint32_t input_dtype_bytes;
+    int status;
+
+    if (out_tokens_staged != NULL) {
+        *out_tokens_staged = 0;
+    }
+    if (ctx == NULL || batch == NULL) {
+        return CAIRN_ERR_INVALID_ARGUMENT;
+    }
+    if (ctx->finalized) {
+        return set_error(ctx, CAIRN_ERR_STATE, "context is finalized");
+    }
+    if (!ctx->plan_loaded) {
+        return set_error(ctx, CAIRN_ERR_STATE, "plan must be loaded before staging batch input");
+    }
+    if (!ctx->arena_allocated || ctx->arena == NULL) {
+        return set_error(ctx, CAIRN_ERR_STATE, "host arena is metadata-only; set CAIRN_ALLOCATE_HOST_ARENA=1");
+    }
+    if (!ctx->dataset_loaded || ctx->dataset_token_bytes == 0) {
+        return set_error(ctx, CAIRN_ERR_STATE, "dataset must be loaded before staging batch input");
+    }
+    input_tokens = find_tensor_by_name(ctx, "input_tokens");
+    if (input_tokens == NULL) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "plan does not contain input_tokens tensor metadata");
+    }
+    input_dtype_bytes = dtype_id_size_bytes(input_tokens->dtype_id);
+    if (input_dtype_bytes == 0 || input_dtype_bytes != ctx->dataset_token_bytes) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "input_tokens tensor dtype does not match dataset token dtype");
+    }
+    if (input_tokens->nbytes == 0 || input_tokens->nbytes % input_dtype_bytes != 0) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "input_tokens tensor byte size is invalid");
+    }
+    if (!tensor_arena_range(ctx, input_tokens, 0, input_tokens->nbytes, &destination)) {
+        return set_error(ctx, CAIRN_ERR_STATE, "input_tokens tensor is not writable in the host arena");
+    }
+
+    token_count = input_tokens->nbytes / input_dtype_bytes;
+    status = cairn_read_batch_tokens(ctx, batch, destination, token_count, input_tokens->nbytes, &tokens_read);
+    if (status != CAIRN_OK) {
+        return status;
+    }
+    if (tokens_read != token_count) {
+        return set_error(ctx, CAIRN_ERR_IO, "dataset reader staged fewer input tokens than requested");
+    }
+    if (out_tokens_staged != NULL) {
+        *out_tokens_staged = tokens_read;
+    }
+    return CAIRN_OK;
+}
+
+int cairn_copy_tensor_bytes(
+    cairn_context_t *ctx,
+    const char *tensor_name,
+    uint64_t byte_offset,
+    void *out,
+    uint64_t out_nbytes
+) {
+    const cairn_tensor_t *tensor;
+    unsigned char *source;
+
+    if (ctx == NULL || tensor_name == NULL || tensor_name[0] == '\0' || out == NULL || out_nbytes == 0) {
+        return CAIRN_ERR_INVALID_ARGUMENT;
+    }
+    if (ctx->finalized) {
+        return set_error(ctx, CAIRN_ERR_STATE, "context is finalized");
+    }
+    if (!ctx->plan_loaded) {
+        return set_error(ctx, CAIRN_ERR_STATE, "plan must be loaded before copying tensor bytes");
+    }
+    if (!ctx->arena_allocated || ctx->arena == NULL) {
+        return set_error(ctx, CAIRN_ERR_STATE, "host arena is metadata-only; set CAIRN_ALLOCATE_HOST_ARENA=1");
+    }
+    tensor = find_tensor_by_name(ctx, tensor_name);
+    if (tensor == NULL) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "tensor name is not present in the loaded plan");
+    }
+    if (!tensor_arena_range(ctx, tensor, byte_offset, out_nbytes, &source)) {
+        return set_error(ctx, CAIRN_ERR_INVALID_ARGUMENT, "tensor byte range is outside the host arena allocation");
+    }
+    memcpy(out, source, (size_t)out_nbytes);
+    return CAIRN_OK;
+}
+
 static void update_stats_for_op(cairn_context_t *ctx, const cairn_plan_op_t *op) {
     ctx->stats.ops_executed += 1;
     if (op->op_class == CAIRN_OP_CLASS_IO) {
@@ -2314,6 +2500,8 @@ static int execute_dependency_plan(cairn_context_t *ctx) {
 }
 
 int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch) {
+    uint64_t input_token_count;
+
     if (ctx == NULL || batch == NULL) {
         return CAIRN_ERR_INVALID_ARGUMENT;
     }
@@ -2329,6 +2517,10 @@ int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch) {
     if (ctx->ops == NULL || ctx->op_count == 0) {
         return set_error(ctx, CAIRN_ERR_PLAN, "loaded plan has no executable ops");
     }
+    input_token_count = plan_input_token_count(ctx);
+    if (input_token_count == 0) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "plan input token count is invalid");
+    }
 
     ctx->trace_count = 0;
     if (ctx->dependency_ref_count > 0) {
@@ -2340,7 +2532,7 @@ int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch) {
     }
     ctx->stats.steps_executed += 1;
     ctx->step += 1;
-    ctx->token_offset += batch->microbatch_size;
+    advance_token_offset(ctx, input_token_count);
     return CAIRN_OK;
 }
 
@@ -2625,6 +2817,17 @@ uint64_t cairn_memory_arena_bytes(const cairn_context_t *ctx) {
         return 0;
     }
     return ctx->arena_bytes;
+}
+
+int cairn_host_arena_allocated(const cairn_context_t *ctx) {
+    if (ctx == NULL) {
+        return 0;
+    }
+    return ctx->arena_allocated;
+}
+
+uint64_t cairn_plan_input_token_count(const cairn_context_t *ctx) {
+    return plan_input_token_count(ctx);
 }
 
 uint64_t cairn_dataset_shard_count(const cairn_context_t *ctx) {

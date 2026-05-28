@@ -133,6 +133,7 @@ class CompileTests(unittest.TestCase):
             self.assertLessEqual(kinds, supported_op_kinds())
             self.assertTrue(all("op_class" in op for op in rank_plan["ops"]))
             self.assertTrue(binary_plan.exists())
+            self.assertTrue(any(tensor["name"] == "input_tokens" for tensor in rank_plan["tensors"]))
             binary_header = BINARY_PLAN_HEADER.unpack(binary_plan.read_bytes()[: BINARY_PLAN_HEADER.size])
             (
                 magic,
@@ -195,7 +196,7 @@ class CompileTests(unittest.TestCase):
             report = simulate_plan(Path(out), failure="rank:3")
             self.assertEqual(report["world_size"], 8)
             self.assertGreater(report["pipeline_bubble_ratio"], 0)
-            self.assertEqual(report["tensor_count_by_rank"]["0"], 8)
+            self.assertEqual(report["tensor_count_by_rank"]["0"], 9)
             self.assertEqual(report["dependency_count_by_rank"]["0"], 16)
             self.assertEqual(report["failure_injection"]["status"], "restart_required")
 

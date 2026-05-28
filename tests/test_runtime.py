@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 import json
+import os
 from pathlib import Path
 
 from cairn.compiler import BINARY_PLAN_HEADER, BINARY_PLAN_OP, BINARY_PLAN_SEGMENT, BINARY_PLAN_TENSOR, compile_plan
@@ -106,6 +107,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             run_result = subprocess.run(
                 [str(binary), str(binary_plan), "8", str(checkpoint), str(trace_path), str(dataset_manifest)],
                 cwd=ROOT,
+                env={**os.environ, "CAIRN_ALLOCATE_HOST_ARENA": "1"},
                 text=True,
                 capture_output=True,
                 check=False,
@@ -114,7 +116,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertIn("cairn runtime smoke ok", run_result.stdout)
             self.assertIn("ops=17", run_result.stdout)
             self.assertIn("segments=7", run_result.stdout)
-            self.assertIn("tensors=8", run_result.stdout)
+            self.assertIn("tensors=9", run_result.stdout)
             self.assertIn("deps=16", run_result.stdout)
             self.assertIn("tensor_refs=", run_result.stdout)
             self.assertIn("dataset_shards=2", run_result.stdout)
@@ -143,7 +145,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(checkpoint_data["step"], 1)
             self.assertEqual(checkpoint_data["ops_executed"], 17)
             self.assertEqual(checkpoint_data["memory_segment_count"], 7)
-            self.assertEqual(checkpoint_data["tensor_count"], 8)
+            self.assertEqual(checkpoint_data["tensor_count"], 9)
             self.assertEqual(checkpoint_data["dependency_ref_count"], 16)
             self.assertGreater(checkpoint_data["tensor_ref_count"], 0)
             self.assertEqual(checkpoint_data["trace_event_count"], 17)
@@ -152,8 +154,8 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(checkpoint_data["dataset_total_tokens"], 16)
             self.assertEqual(checkpoint_data["dataset_token_bytes"], 4)
             self.assertEqual(checkpoint_data["dataset_cursor_shard_index"], 0)
-            self.assertEqual(checkpoint_data["dataset_cursor_shard_token_offset"], 2)
-            self.assertEqual(checkpoint_data["dataset_cursor_tokens_available"], 6)
+            self.assertEqual(checkpoint_data["dataset_cursor_shard_token_offset"], 0)
+            self.assertEqual(checkpoint_data["dataset_cursor_tokens_available"], 8)
             self.assertGreaterEqual(checkpoint_data["arena_bytes"], checkpoint_data["estimated_memory_bytes"])
             self.assertGreater(checkpoint_data["compute_ops"], 0)
             self.assertGreater(checkpoint_data["communication_ops"], 0)
