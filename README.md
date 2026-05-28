@@ -54,6 +54,10 @@ See the full design here:
 
 - [docs/ai-training-stack-design.md](docs/ai-training-stack-design.md)
 
+See the long-horizon product roadmap here:
+
+- [ROADMAP.md](ROADMAP.md)
+
 ## Scope
 
 This is a design repository, not a runnable trainer. The first practical implementation milestone would be a single-GPU C trainer with a static memory arena, fixed model math, checkpoint support, and trace output. Distributed execution should only follow after correctness is established against a reference implementation.
