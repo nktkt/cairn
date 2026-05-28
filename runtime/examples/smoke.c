@@ -15,6 +15,8 @@ int main(int argc, char **argv) {
     cairn_context_t *ctx = NULL;
     cairn_batch_t batch;
     cairn_runtime_stats_t stats;
+    cairn_trace_event_t first_trace;
+    cairn_trace_event_t last_trace;
     cairn_init_desc_t desc;
     unsigned int world_size;
     char plan_id[65];
@@ -26,8 +28,8 @@ int main(int argc, char **argv) {
     unsigned long long tensor_ref_count;
     unsigned long long arena_bytes;
 
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s RANK_PLAN WORLD_SIZE CHECKPOINT_OUT\n", argv[0]);
+    if (argc != 4 && argc != 5) {
+        fprintf(stderr, "usage: %s RANK_PLAN WORLD_SIZE CHECKPOINT_OUT [TRACE_OUT]\n", argv[0]);
         return 2;
     }
     if (sscanf(argv[2], "%u", &world_size) != 1 || world_size == 0) {
@@ -88,6 +90,24 @@ int main(int argc, char **argv) {
         cairn_finalize(ctx);
         return 1;
     }
+    if (cairn_trace_event_count(ctx) != cairn_plan_op_count(ctx)) {
+        fprintf(stderr, "runtime trace did not record executed op table\n");
+        cairn_finalize(ctx);
+        return 1;
+    }
+    if (expect_ok(cairn_get_trace_event(ctx, 0, &first_trace), "cairn_get_trace_event_first", ctx)) {
+        cairn_finalize(ctx);
+        return 1;
+    }
+    if (expect_ok(cairn_get_trace_event(ctx, cairn_trace_event_count(ctx) - 1, &last_trace), "cairn_get_trace_event_last", ctx)) {
+        cairn_finalize(ctx);
+        return 1;
+    }
+    if (first_trace.ordinal != 0 || first_trace.dep_count != 0 || last_trace.ordinal + 1 != cairn_trace_event_count(ctx)) {
+        fprintf(stderr, "runtime trace has unexpected execution order metadata\n");
+        cairn_finalize(ctx);
+        return 1;
+    }
     if (stats.compute_ops == 0 || stats.communication_ops == 0 || stats.io_ops == 0) {
         fprintf(stderr, "runtime stats did not classify compute/communication/io ops\n");
         cairn_finalize(ctx);
@@ -99,6 +119,10 @@ int main(int argc, char **argv) {
         return 1;
     }
     if (expect_ok(cairn_save_checkpoint(ctx, argv[3]), "cairn_save_checkpoint", ctx)) {
+        cairn_finalize(ctx);
+        return 1;
+    }
+    if (argc == 5 && expect_ok(cairn_write_trace(ctx, argv[4]), "cairn_write_trace", ctx)) {
         cairn_finalize(ctx);
         return 1;
     }

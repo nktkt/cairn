@@ -44,12 +44,31 @@ typedef struct {
     uint64_t io_bytes;
 } cairn_runtime_stats_t;
 
+typedef struct {
+    uint64_t step;
+    uint64_t ordinal;
+    uint64_t bytes;
+    uint64_t logical_start;
+    uint64_t logical_end;
+    uint32_t op_id;
+    uint32_t tick;
+    uint32_t dep_count;
+    uint32_t input_count;
+    uint32_t output_count;
+    uint32_t op_class;
+    char kind[48];
+    char stream[32];
+} cairn_trace_event_t;
+
 int cairn_init(cairn_context_t **ctx, const cairn_init_desc_t *desc);
 int cairn_load_plan(cairn_context_t *ctx, const char *path);
 int cairn_load_checkpoint(cairn_context_t *ctx, const char *path);
 int cairn_next_batch(cairn_context_t *ctx, cairn_batch_t *batch);
 int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch);
 int cairn_get_stats(const cairn_context_t *ctx, cairn_runtime_stats_t *stats);
+uint64_t cairn_trace_event_count(const cairn_context_t *ctx);
+int cairn_get_trace_event(const cairn_context_t *ctx, uint64_t index, cairn_trace_event_t *event);
+int cairn_write_trace(cairn_context_t *ctx, const char *path);
 int cairn_should_checkpoint(cairn_context_t *ctx);
 int cairn_save_checkpoint(cairn_context_t *ctx, const char *tag);
 int cairn_finalize(cairn_context_t *ctx);

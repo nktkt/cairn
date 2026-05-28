@@ -28,6 +28,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             binary = temp_path / "runtime-smoke"
             restore_binary = temp_path / "runtime-restore"
             checkpoint = temp_path / "checkpoint"
+            trace_path = temp_path / "trace.jsonl"
             compile_plan(
                 model=load_example("model"),
                 training=load_example("training"),
@@ -80,7 +81,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(restore_compile_result.returncode, 0, restore_compile_result.stderr)
 
             run_result = subprocess.run(
-                [str(binary), str(binary_plan), "8", str(checkpoint)],
+                [str(binary), str(binary_plan), "8", str(checkpoint), str(trace_path)],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
@@ -93,6 +94,16 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertIn("tensors=8", run_result.stdout)
             self.assertIn("deps=16", run_result.stdout)
             self.assertIn("tensor_refs=", run_result.stdout)
+            self.assertTrue(trace_path.exists())
+            trace_lines = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(trace_lines), 17)
+            self.assertEqual(trace_lines[0]["ordinal"], 0)
+            self.assertEqual(trace_lines[0]["op_id"], 0)
+            self.assertEqual(trace_lines[0]["kind"], "rmsnorm")
+            self.assertEqual(trace_lines[0]["dep_count"], 0)
+            self.assertEqual(trace_lines[1]["dep_count"], 1)
+            self.assertEqual(trace_lines[-1]["op_class"], "io")
+            self.assertEqual(trace_lines[-1]["logical_end"], trace_lines[-1]["logical_start"] + 1)
             self.assertTrue((checkpoint / "latest.json").exists())
             latest_data = load_json(checkpoint / "latest.json")
             self.assertTrue(latest_data["complete"])
@@ -110,6 +121,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(checkpoint_data["tensor_count"], 8)
             self.assertEqual(checkpoint_data["dependency_ref_count"], 16)
             self.assertGreater(checkpoint_data["tensor_ref_count"], 0)
+            self.assertEqual(checkpoint_data["trace_event_count"], 17)
             self.assertGreaterEqual(checkpoint_data["arena_bytes"], checkpoint_data["estimated_memory_bytes"])
             self.assertGreater(checkpoint_data["compute_ops"], 0)
             self.assertGreater(checkpoint_data["communication_ops"], 0)

@@ -67,10 +67,15 @@ struct cairn_context {
     cairn_tensor_t *tensors;
     uint32_t *dependency_refs;
     uint32_t *tensor_refs;
+    cairn_trace_event_t *trace_events;
+    uint8_t *scheduler_marks;
+    uint64_t *op_logical_end;
     uint64_t segment_count;
     uint64_t tensor_count;
     uint64_t dependency_ref_count;
     uint64_t tensor_ref_count;
+    uint64_t trace_count;
+    uint64_t trace_capacity;
     uint64_t arena_bytes;
     void *arena;
     int arena_allocated;
@@ -439,6 +444,16 @@ static int stream_matches_class(const char *stream, cairn_op_class_t op_class) {
     return stream_is_compute(stream);
 }
 
+static const char *op_class_name(cairn_op_class_t op_class) {
+    if (op_class == CAIRN_OP_CLASS_IO) {
+        return "io";
+    }
+    if (op_class == CAIRN_OP_CLASS_COMMUNICATION) {
+        return "communication";
+    }
+    return "compute";
+}
+
 static int dtype_id_is_valid(uint32_t dtype_id) {
     return dtype_id >= 1 && dtype_id <= 4;
 }
@@ -643,6 +658,7 @@ static int parse_op_table(const char *json, cairn_plan_op_t **out_ops, uint64_t 
             return 0;
         }
         ops[index].op_id = parsed;
+        ops[index].tick = (uint32_t)parsed;
         if (!parse_json_string(object_json, "kind", ops[index].kind, sizeof(ops[index].kind))) {
             free(object_json);
             free(ops);
@@ -819,6 +835,30 @@ static int reserve_arena(cairn_context_t *ctx, uint64_t arena_bytes) {
     return 1;
 }
 
+static int reserve_execution_state(cairn_context_t *ctx, uint64_t op_count) {
+    if (ctx == NULL || op_count == 0 || (uint64_t)((size_t)op_count) != op_count) {
+        return 0;
+    }
+
+    ctx->trace_events = (cairn_trace_event_t *)calloc((size_t)op_count, sizeof(cairn_trace_event_t));
+    ctx->scheduler_marks = (uint8_t *)calloc((size_t)op_count, sizeof(uint8_t));
+    ctx->op_logical_end = (uint64_t *)calloc((size_t)op_count, sizeof(uint64_t));
+    if (ctx->trace_events == NULL || ctx->scheduler_marks == NULL || ctx->op_logical_end == NULL) {
+        free(ctx->trace_events);
+        free(ctx->scheduler_marks);
+        free(ctx->op_logical_end);
+        ctx->trace_events = NULL;
+        ctx->scheduler_marks = NULL;
+        ctx->op_logical_end = NULL;
+        ctx->trace_capacity = 0;
+        ctx->trace_count = 0;
+        return 0;
+    }
+    ctx->trace_capacity = op_count;
+    ctx->trace_count = 0;
+    return 1;
+}
+
 static int restore_checkpoint_contents(cairn_context_t *ctx, const char *contents) {
     char checkpoint_plan_id[65];
     uint64_t parsed;
@@ -895,6 +935,7 @@ static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     fprintf(file, "  \"compute_ops\": %llu,\n", (unsigned long long)ctx->stats.compute_ops);
     fprintf(file, "  \"communication_ops\": %llu,\n", (unsigned long long)ctx->stats.communication_ops);
     fprintf(file, "  \"io_ops\": %llu,\n", (unsigned long long)ctx->stats.io_ops);
+    fprintf(file, "  \"trace_event_count\": %llu,\n", (unsigned long long)ctx->trace_count);
     fprintf(file, "  \"compute_bytes\": %llu,\n", (unsigned long long)ctx->stats.compute_bytes);
     fprintf(file, "  \"communication_bytes\": %llu,\n", (unsigned long long)ctx->stats.communication_bytes);
     fprintf(file, "  \"io_bytes\": %llu\n", (unsigned long long)ctx->stats.io_bytes);
@@ -923,6 +964,12 @@ static void clear_plan(cairn_context_t *ctx) {
     ctx->dependency_refs = NULL;
     free(ctx->tensor_refs);
     ctx->tensor_refs = NULL;
+    free(ctx->trace_events);
+    ctx->trace_events = NULL;
+    free(ctx->scheduler_marks);
+    ctx->scheduler_marks = NULL;
+    free(ctx->op_logical_end);
+    ctx->op_logical_end = NULL;
     free(ctx->arena);
     ctx->arena = NULL;
     ctx->op_count = 0;
@@ -930,6 +977,8 @@ static void clear_plan(cairn_context_t *ctx) {
     ctx->tensor_count = 0;
     ctx->dependency_ref_count = 0;
     ctx->tensor_ref_count = 0;
+    ctx->trace_count = 0;
+    ctx->trace_capacity = 0;
     ctx->estimated_memory_bytes = 0;
     ctx->arena_bytes = 0;
     ctx->arena_allocated = 0;
@@ -1307,6 +1356,10 @@ static int load_binary_rank_plan(cairn_context_t *ctx, const unsigned char *cont
         clear_plan(ctx);
         return set_error(ctx, CAIRN_ERR_STATE, "memory arena could not be reserved");
     }
+    if (!reserve_execution_state(ctx, ctx->op_count)) {
+        clear_plan(ctx);
+        return set_error(ctx, CAIRN_ERR_STATE, "runtime execution state could not be reserved");
+    }
     ctx->plan_loaded = 1;
     return CAIRN_OK;
 }
@@ -1340,10 +1393,15 @@ int cairn_init(cairn_context_t **ctx, const cairn_init_desc_t *desc) {
     created->tensors = NULL;
     created->dependency_refs = NULL;
     created->tensor_refs = NULL;
+    created->trace_events = NULL;
+    created->scheduler_marks = NULL;
+    created->op_logical_end = NULL;
     created->segment_count = 0;
     created->tensor_count = 0;
     created->dependency_ref_count = 0;
     created->tensor_ref_count = 0;
+    created->trace_count = 0;
+    created->trace_capacity = 0;
     created->arena_bytes = 0;
     created->arena = NULL;
     created->arena_allocated = 0;
@@ -1478,6 +1536,10 @@ int cairn_load_plan(cairn_context_t *ctx, const char *path) {
         clear_plan(ctx);
         return set_error(ctx, CAIRN_ERR_STATE, "memory arena could not be reserved");
     }
+    if (!reserve_execution_state(ctx, ctx->op_count)) {
+        clear_plan(ctx);
+        return set_error(ctx, CAIRN_ERR_STATE, "runtime execution state could not be reserved");
+    }
     ctx->plan_loaded = 1;
     return CAIRN_OK;
 }
@@ -1578,9 +1640,145 @@ int cairn_next_batch(cairn_context_t *ctx, cairn_batch_t *batch) {
     return CAIRN_OK;
 }
 
-int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch) {
+static void update_stats_for_op(cairn_context_t *ctx, const cairn_plan_op_t *op) {
+    ctx->stats.ops_executed += 1;
+    if (op->op_class == CAIRN_OP_CLASS_IO) {
+        ctx->stats.io_ops += 1;
+        ctx->stats.io_bytes += op->bytes;
+    } else if (op->op_class == CAIRN_OP_CLASS_COMMUNICATION) {
+        ctx->stats.communication_ops += 1;
+        ctx->stats.communication_bytes += op->bytes;
+    } else {
+        ctx->stats.compute_ops += 1;
+        ctx->stats.compute_bytes += op->bytes;
+    }
+}
+
+static void record_trace_event(
+    cairn_context_t *ctx,
+    const cairn_plan_op_t *op,
+    uint64_t ordinal,
+    uint64_t logical_start,
+    uint64_t logical_end
+) {
+    cairn_trace_event_t *event;
+
+    if (ctx == NULL || op == NULL || ctx->trace_events == NULL || ctx->trace_count >= ctx->trace_capacity) {
+        return;
+    }
+
+    event = &ctx->trace_events[ctx->trace_count++];
+    memset(event, 0, sizeof(*event));
+    event->step = ctx->step;
+    event->ordinal = ordinal;
+    event->bytes = op->bytes;
+    event->logical_start = logical_start;
+    event->logical_end = logical_end;
+    event->op_id = (uint32_t)op->op_id;
+    event->tick = op->tick;
+    event->dep_count = op->dep_count;
+    event->input_count = op->input_count;
+    event->output_count = op->output_count;
+    event->op_class = (uint32_t)op->op_class;
+    snprintf(event->kind, sizeof(event->kind), "%s", op->kind);
+    snprintf(event->stream, sizeof(event->stream), "%s", op->stream);
+}
+
+static int op_dependencies_ready(const cairn_context_t *ctx, uint64_t op_index, uint64_t *logical_start) {
+    const cairn_plan_op_t *op;
+    uint32_t dep_index;
+    uint64_t start;
+
+    if (ctx == NULL || logical_start == NULL || op_index >= ctx->op_count) {
+        return 0;
+    }
+
+    op = &ctx->ops[op_index];
+    start = op->tick;
+    for (dep_index = 0; dep_index < op->dep_count; dep_index++) {
+        uint32_t dep = ctx->dependency_refs[op->dep_first + dep_index];
+
+        if (dep >= ctx->op_count || ctx->scheduler_marks[dep] == 0) {
+            return 0;
+        }
+        if (ctx->op_logical_end[dep] > start) {
+            start = ctx->op_logical_end[dep];
+        }
+    }
+    *logical_start = start;
+    return 1;
+}
+
+static int execute_op(cairn_context_t *ctx, uint64_t op_index, uint64_t ordinal, uint64_t logical_start) {
+    const cairn_plan_op_t *op;
+    uint64_t logical_end;
+
+    if (ctx == NULL || op_index >= ctx->op_count) {
+        return 0;
+    }
+
+    op = &ctx->ops[op_index];
+    logical_end = logical_start + 1;
+    update_stats_for_op(ctx, op);
+    if (ctx->op_logical_end != NULL) {
+        ctx->op_logical_end[op_index] = logical_end;
+    }
+    record_trace_event(ctx, op, ordinal, logical_start, logical_end);
+    return 1;
+}
+
+static int execute_sequential_plan(cairn_context_t *ctx) {
     uint64_t index;
 
+    for (index = 0; index < ctx->op_count; index++) {
+        const cairn_plan_op_t *op = &ctx->ops[index];
+        uint64_t logical_start = op->tick > index ? op->tick : index;
+
+        if (!execute_op(ctx, index, index, logical_start)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int execute_dependency_plan(cairn_context_t *ctx) {
+    uint64_t executed;
+
+    if (ctx == NULL || ctx->scheduler_marks == NULL || ctx->op_logical_end == NULL) {
+        return 0;
+    }
+
+    memset(ctx->scheduler_marks, 0, (size_t)ctx->op_count);
+    memset(ctx->op_logical_end, 0, (size_t)ctx->op_count * sizeof(uint64_t));
+    executed = 0;
+    while (executed < ctx->op_count) {
+        uint64_t index;
+        int made_progress = 0;
+
+        for (index = 0; index < ctx->op_count; index++) {
+            uint64_t logical_start;
+
+            if (ctx->scheduler_marks[index] != 0) {
+                continue;
+            }
+            if (!op_dependencies_ready(ctx, index, &logical_start)) {
+                continue;
+            }
+            if (!execute_op(ctx, index, executed, logical_start)) {
+                return 0;
+            }
+            ctx->scheduler_marks[index] = 1;
+            executed++;
+            made_progress = 1;
+        }
+        if (!made_progress) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch) {
     if (ctx == NULL || batch == NULL) {
         return CAIRN_ERR_INVALID_ARGUMENT;
     }
@@ -1597,20 +1795,13 @@ int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch) {
         return set_error(ctx, CAIRN_ERR_PLAN, "loaded plan has no executable ops");
     }
 
-    for (index = 0; index < ctx->op_count; index++) {
-        const cairn_plan_op_t *op = &ctx->ops[index];
-
-        ctx->stats.ops_executed += 1;
-        if (op->op_class == CAIRN_OP_CLASS_IO) {
-            ctx->stats.io_ops += 1;
-            ctx->stats.io_bytes += op->bytes;
-        } else if (op->op_class == CAIRN_OP_CLASS_COMMUNICATION) {
-            ctx->stats.communication_ops += 1;
-            ctx->stats.communication_bytes += op->bytes;
-        } else {
-            ctx->stats.compute_ops += 1;
-            ctx->stats.compute_bytes += op->bytes;
+    ctx->trace_count = 0;
+    if (ctx->dependency_ref_count > 0) {
+        if (!execute_dependency_plan(ctx)) {
+            return set_error(ctx, CAIRN_ERR_PLAN, "dependency scheduler could not execute loaded op graph");
         }
+    } else if (!execute_sequential_plan(ctx)) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "sequential scheduler could not execute loaded op table");
     }
     ctx->stats.steps_executed += 1;
     ctx->step += 1;
@@ -1623,6 +1814,77 @@ int cairn_get_stats(const cairn_context_t *ctx, cairn_runtime_stats_t *stats) {
         return CAIRN_ERR_INVALID_ARGUMENT;
     }
     *stats = ctx->stats;
+    return CAIRN_OK;
+}
+
+uint64_t cairn_trace_event_count(const cairn_context_t *ctx) {
+    if (ctx == NULL) {
+        return 0;
+    }
+    return ctx->trace_count;
+}
+
+int cairn_get_trace_event(const cairn_context_t *ctx, uint64_t index, cairn_trace_event_t *event) {
+    if (ctx == NULL || event == NULL) {
+        return CAIRN_ERR_INVALID_ARGUMENT;
+    }
+    if (index >= ctx->trace_count || ctx->trace_events == NULL) {
+        return CAIRN_ERR_INVALID_ARGUMENT;
+    }
+    *event = ctx->trace_events[index];
+    return CAIRN_OK;
+}
+
+int cairn_write_trace(cairn_context_t *ctx, const char *path) {
+    FILE *file;
+    char tmp_path[CAIRN_PATH_MAX];
+    uint64_t index;
+
+    if (ctx == NULL || path == NULL || path[0] == '\0') {
+        return CAIRN_ERR_INVALID_ARGUMENT;
+    }
+    if (ctx->finalized) {
+        return set_error(ctx, CAIRN_ERR_STATE, "context is finalized");
+    }
+    if (!ctx->plan_loaded) {
+        return set_error(ctx, CAIRN_ERR_STATE, "plan must be loaded before writing trace");
+    }
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path) <= 0 || strlen(path) + 4 >= sizeof(tmp_path)) {
+        return set_error(ctx, CAIRN_ERR_IO, "trace temporary path is too long");
+    }
+
+    file = fopen(tmp_path, "wb");
+    if (file == NULL) {
+        return set_error(ctx, CAIRN_ERR_IO, "trace file could not be opened for writing");
+    }
+    for (index = 0; index < ctx->trace_count; index++) {
+        const cairn_trace_event_t *event = &ctx->trace_events[index];
+
+        fprintf(file,
+                "{\"version\":1,\"plan_id\":\"%s\",\"global_rank\":%u,\"step\":%llu,\"ordinal\":%llu,\"op_id\":%u,\"tick\":%u,\"kind\":\"%s\",\"stream\":\"%s\",\"op_class\":\"%s\",\"dep_count\":%u,\"input_count\":%u,\"output_count\":%u,\"bytes\":%llu,\"logical_start\":%llu,\"logical_end\":%llu}\n",
+                ctx->plan_id,
+                ctx->desc.global_rank,
+                (unsigned long long)event->step,
+                (unsigned long long)event->ordinal,
+                event->op_id,
+                event->tick,
+                event->kind,
+                event->stream,
+                op_class_name((cairn_op_class_t)event->op_class),
+                event->dep_count,
+                event->input_count,
+                event->output_count,
+                (unsigned long long)event->bytes,
+                (unsigned long long)event->logical_start,
+                (unsigned long long)event->logical_end);
+    }
+    if (fclose(file) != 0) {
+        remove(tmp_path);
+        return set_error(ctx, CAIRN_ERR_IO, "trace file could not be closed");
+    }
+    if (!atomic_publish(tmp_path, path)) {
+        return set_error(ctx, CAIRN_ERR_IO, "trace file could not be published");
+    }
     return CAIRN_OK;
 }
 
@@ -1754,6 +2016,12 @@ int cairn_finalize(cairn_context_t *ctx) {
     ctx->dependency_refs = NULL;
     free(ctx->tensor_refs);
     ctx->tensor_refs = NULL;
+    free(ctx->trace_events);
+    ctx->trace_events = NULL;
+    free(ctx->scheduler_marks);
+    ctx->scheduler_marks = NULL;
+    free(ctx->op_logical_end);
+    ctx->op_logical_end = NULL;
     free(ctx->arena);
     ctx->arena = NULL;
     free(ctx);
