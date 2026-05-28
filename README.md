@@ -91,10 +91,21 @@ cc -std=c11 -Wall -Wextra -Werror \
 /tmp/cairn-runtime-smoke \
   build/plan/ranks/rank_000000.json \
   8 \
-  /tmp/cairn-checkpoint.json
+  /tmp/cairn-checkpoints
 ```
 
 By default the runtime reserves arena metadata only. Set `CAIRN_ALLOCATE_HOST_ARENA=1` to allocate the full host arena for small local smoke plans.
+
+The smoke runtime writes checkpoint artifacts in a shard-like layout:
+
+```text
+/tmp/cairn-checkpoints/
+  latest.json
+  step_000000001/
+    manifest.json
+    ranks/
+      rank_000000.json
+```
 
 ## What Is Included
 

@@ -26,7 +26,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             temp_path = Path(temp)
             plan_dir = temp_path / "plan"
             binary = temp_path / "runtime-smoke"
-            checkpoint = temp_path / "checkpoint.json"
+            checkpoint = temp_path / "checkpoint"
             compile_plan(
                 model=load_example("model"),
                 training=load_example("training"),
@@ -67,8 +67,15 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertIn("cairn runtime smoke ok", run_result.stdout)
             self.assertIn("ops=17", run_result.stdout)
             self.assertIn("segments=7", run_result.stdout)
-            self.assertTrue(checkpoint.exists())
-            checkpoint_data = load_json(checkpoint)
+            self.assertTrue((checkpoint / "latest.json").exists())
+            latest_data = load_json(checkpoint / "latest.json")
+            manifest_path = checkpoint / latest_data["manifest_path"]
+            self.assertTrue(manifest_path.exists())
+            manifest_data = load_json(manifest_path)
+            self.assertEqual(manifest_data["rank_count"], 1)
+            rank_shard = manifest_path.parent / manifest_data["rank_shard_path"]
+            self.assertTrue(rank_shard.exists())
+            checkpoint_data = load_json(rank_shard)
             self.assertEqual(checkpoint_data["step"], 1)
             self.assertEqual(checkpoint_data["ops_executed"], 17)
             self.assertEqual(checkpoint_data["memory_segment_count"], 7)
@@ -81,7 +88,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertGreater(checkpoint_data["io_bytes"], 0)
 
             mismatch_result = subprocess.run(
-                [str(binary), str(plan_dir / "ranks" / "rank_000000.json"), "7", str(temp_path / "bad.json")],
+                [str(binary), str(plan_dir / "ranks" / "rank_000000.json"), "7", str(temp_path / "bad-checkpoint")],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
@@ -95,7 +102,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             bad_plan_data["memory"]["segments"][1]["offset"] = 1
             bad_plan.write_text(json.dumps(bad_plan_data, indent=2, sort_keys=True), encoding="utf-8")
             bad_memory_result = subprocess.run(
-                [str(binary), str(bad_plan), "8", str(temp_path / "bad-memory-checkpoint.json")],
+                [str(binary), str(bad_plan), "8", str(temp_path / "bad-memory-checkpoint")],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
@@ -109,7 +116,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             bad_kind_data["ops"][0]["kind"] = "unknown_kernel"
             bad_kind.write_text(json.dumps(bad_kind_data, indent=2, sort_keys=True), encoding="utf-8")
             bad_kind_result = subprocess.run(
-                [str(binary), str(bad_kind), "8", str(temp_path / "bad-kind-checkpoint.json")],
+                [str(binary), str(bad_kind), "8", str(temp_path / "bad-kind-checkpoint")],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
@@ -123,7 +130,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             bad_stream_data["ops"][0]["stream"] = "comm_dp"
             bad_stream.write_text(json.dumps(bad_stream_data, indent=2, sort_keys=True), encoding="utf-8")
             bad_stream_result = subprocess.run(
-                [str(binary), str(bad_stream), "8", str(temp_path / "bad-stream-checkpoint.json")],
+                [str(binary), str(bad_stream), "8", str(temp_path / "bad-stream-checkpoint")],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,

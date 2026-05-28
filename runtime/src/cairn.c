@@ -4,6 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+#define CAIRN_PATH_MAX 1024
 
 typedef enum {
     CAIRN_OP_CLASS_COMPUTE = 0,
@@ -85,6 +90,74 @@ static int file_exists(const char *path) {
         return 0;
     }
     fclose(file);
+    return 1;
+}
+
+static int path_is_directory(const char *path) {
+    struct stat info;
+
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    if (stat(path, &info) != 0) {
+        return 0;
+    }
+    return S_ISDIR(info.st_mode) ? 1 : 0;
+}
+
+static int ensure_directory(const char *path) {
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    if (mkdir(path, 0777) == 0) {
+        return 1;
+    }
+    if (errno == EEXIST && path_is_directory(path)) {
+        return 1;
+    }
+    return 0;
+}
+
+static int join_path(char *out, size_t out_size, const char *left, const char *right) {
+    int written;
+
+    if (out == NULL || out_size == 0 || left == NULL || right == NULL || left[0] == '\0' || right[0] == '\0') {
+        return 0;
+    }
+    if (right[0] == '/') {
+        written = snprintf(out, out_size, "%s", right);
+    } else if (left[strlen(left) - 1] == '/') {
+        written = snprintf(out, out_size, "%s%s", left, right);
+    } else {
+        written = snprintf(out, out_size, "%s/%s", left, right);
+    }
+    return written > 0 && (size_t)written < out_size;
+}
+
+static int dirname_of(char *out, size_t out_size, const char *path) {
+    const char *slash;
+    size_t nbytes;
+
+    if (out == NULL || out_size == 0 || path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    slash = strrchr(path, '/');
+    if (slash == NULL) {
+        if (out_size < 2) {
+            return 0;
+        }
+        snprintf(out, out_size, ".");
+        return 1;
+    }
+    nbytes = (size_t)(slash - path);
+    if (nbytes == 0) {
+        nbytes = 1;
+    }
+    if (nbytes + 1 > out_size) {
+        return 0;
+    }
+    memcpy(out, path, nbytes);
+    out[nbytes] = '\0';
     return 1;
 }
 
@@ -614,6 +687,84 @@ static int reserve_arena(cairn_context_t *ctx, uint64_t arena_bytes) {
     return 1;
 }
 
+static int restore_checkpoint_contents(cairn_context_t *ctx, const char *contents) {
+    char checkpoint_plan_id[65];
+    uint64_t parsed;
+
+    if (ctx == NULL || contents == NULL) {
+        return 0;
+    }
+    if (parse_json_string(contents, "plan_id", checkpoint_plan_id, sizeof(checkpoint_plan_id))) {
+        if (ctx->plan_loaded && strcmp(checkpoint_plan_id, ctx->plan_id) != 0) {
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint plan_id does not match loaded plan");
+        }
+    }
+    if (parse_json_u64(contents, "step", &parsed)) {
+        ctx->step = parsed;
+    }
+    if (parse_json_u64(contents, "token_offset", &parsed)) {
+        ctx->token_offset = parsed;
+    }
+    if (parse_json_u64(contents, "ops_executed", &parsed)) {
+        ctx->stats.ops_executed = parsed;
+    }
+    if (parse_json_u64(contents, "compute_ops", &parsed)) {
+        ctx->stats.compute_ops = parsed;
+    }
+    if (parse_json_u64(contents, "communication_ops", &parsed)) {
+        ctx->stats.communication_ops = parsed;
+    }
+    if (parse_json_u64(contents, "io_ops", &parsed)) {
+        ctx->stats.io_ops = parsed;
+    }
+    if (parse_json_u64(contents, "compute_bytes", &parsed)) {
+        ctx->stats.compute_bytes = parsed;
+    }
+    if (parse_json_u64(contents, "communication_bytes", &parsed)) {
+        ctx->stats.communication_bytes = parsed;
+    }
+    if (parse_json_u64(contents, "io_bytes", &parsed)) {
+        ctx->stats.io_bytes = parsed;
+    }
+    if (ctx->op_count > 0 && ctx->stats.ops_executed >= ctx->op_count) {
+        ctx->stats.steps_executed = ctx->stats.ops_executed / ctx->op_count;
+    }
+    return CAIRN_OK;
+}
+
+static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
+    FILE *file;
+
+    file = fopen(path, "wb");
+    if (file == NULL) {
+        return set_error(ctx, CAIRN_ERR_IO, "rank checkpoint shard could not be opened for writing");
+    }
+    fprintf(file, "{\n");
+    fprintf(file, "  \"version\": 1,\n");
+    fprintf(file, "  \"plan_id\": \"%s\",\n", ctx->plan_id);
+    fprintf(file, "  \"global_rank\": %u,\n", ctx->desc.global_rank);
+    fprintf(file, "  \"world_size\": %u,\n", ctx->plan_world_size);
+    fprintf(file, "  \"step\": %llu,\n", (unsigned long long)ctx->step);
+    fprintf(file, "  \"token_offset\": %llu,\n", (unsigned long long)ctx->token_offset);
+    fprintf(file, "  \"op_count\": %llu,\n", (unsigned long long)ctx->op_count);
+    fprintf(file, "  \"estimated_memory_bytes\": %llu,\n", (unsigned long long)ctx->estimated_memory_bytes);
+    fprintf(file, "  \"memory_segment_count\": %llu,\n", (unsigned long long)ctx->segment_count);
+    fprintf(file, "  \"arena_bytes\": %llu,\n", (unsigned long long)ctx->arena_bytes);
+    fprintf(file, "  \"arena_allocated\": %s,\n", ctx->arena_allocated ? "true" : "false");
+    fprintf(file, "  \"ops_executed\": %llu,\n", (unsigned long long)ctx->stats.ops_executed);
+    fprintf(file, "  \"compute_ops\": %llu,\n", (unsigned long long)ctx->stats.compute_ops);
+    fprintf(file, "  \"communication_ops\": %llu,\n", (unsigned long long)ctx->stats.communication_ops);
+    fprintf(file, "  \"io_ops\": %llu,\n", (unsigned long long)ctx->stats.io_ops);
+    fprintf(file, "  \"compute_bytes\": %llu,\n", (unsigned long long)ctx->stats.compute_bytes);
+    fprintf(file, "  \"communication_bytes\": %llu,\n", (unsigned long long)ctx->stats.communication_bytes);
+    fprintf(file, "  \"io_bytes\": %llu\n", (unsigned long long)ctx->stats.io_bytes);
+    fprintf(file, "}\n");
+    if (fclose(file) != 0) {
+        return set_error(ctx, CAIRN_ERR_IO, "rank checkpoint shard could not be closed");
+    }
+    return CAIRN_OK;
+}
+
 static void clear_plan(cairn_context_t *ctx) {
     if (ctx == NULL) {
         return;
@@ -785,8 +936,13 @@ int cairn_load_plan(cairn_context_t *ctx, const char *path) {
 int cairn_load_checkpoint(cairn_context_t *ctx, const char *path) {
     char *contents;
     size_t contents_size;
-    char checkpoint_plan_id[65];
-    uint64_t parsed;
+    char latest_path[CAIRN_PATH_MAX];
+    char manifest_rel[CAIRN_PATH_MAX];
+    char manifest_path[CAIRN_PATH_MAX];
+    char manifest_dir[CAIRN_PATH_MAX];
+    char rank_shard_rel[CAIRN_PATH_MAX];
+    char rank_shard_path[CAIRN_PATH_MAX];
+    int status;
 
     if (ctx == NULL || path == NULL) {
         return CAIRN_ERR_INVALID_ARGUMENT;
@@ -794,28 +950,55 @@ int cairn_load_checkpoint(cairn_context_t *ctx, const char *path) {
     if (ctx->finalized) {
         return set_error(ctx, CAIRN_ERR_STATE, "context is finalized");
     }
-    if (!file_exists(path)) {
-        return set_error(ctx, CAIRN_ERR_IO, "checkpoint file does not exist");
-    }
+    if (path_is_directory(path)) {
+        if (!join_path(latest_path, sizeof(latest_path), path, "latest.json")) {
+            return set_error(ctx, CAIRN_ERR_IO, "checkpoint latest path is too long");
+        }
+        contents = read_file(latest_path, &contents_size);
+        if (contents == NULL || contents_size == 0) {
+            free(contents);
+            return set_error(ctx, CAIRN_ERR_IO, "checkpoint latest manifest could not be read");
+        }
+        if (!parse_json_string(contents, "manifest_path", manifest_rel, sizeof(manifest_rel))) {
+            free(contents);
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint latest manifest does not contain manifest_path");
+        }
+        free(contents);
 
-    contents = read_file(path, &contents_size);
+        if (!join_path(manifest_path, sizeof(manifest_path), path, manifest_rel)) {
+            return set_error(ctx, CAIRN_ERR_IO, "checkpoint manifest path is too long");
+        }
+        contents = read_file(manifest_path, &contents_size);
+        if (contents == NULL || contents_size == 0) {
+            free(contents);
+            return set_error(ctx, CAIRN_ERR_IO, "checkpoint manifest could not be read");
+        }
+        if (!parse_json_string(contents, "rank_shard_path", rank_shard_rel, sizeof(rank_shard_rel))) {
+            free(contents);
+            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint manifest does not contain rank_shard_path");
+        }
+        if (!dirname_of(manifest_dir, sizeof(manifest_dir), manifest_path)) {
+            free(contents);
+            return set_error(ctx, CAIRN_ERR_IO, "checkpoint manifest directory is invalid");
+        }
+        free(contents);
+
+        if (!join_path(rank_shard_path, sizeof(rank_shard_path), manifest_dir, rank_shard_rel)) {
+            return set_error(ctx, CAIRN_ERR_IO, "checkpoint rank shard path is too long");
+        }
+        contents = read_file(rank_shard_path, &contents_size);
+    } else {
+        contents = read_file(path, &contents_size);
+    }
     if (contents == NULL || contents_size == 0) {
         free(contents);
         return set_error(ctx, CAIRN_ERR_IO, "checkpoint file could not be read");
     }
-    if (parse_json_string(contents, "plan_id", checkpoint_plan_id, sizeof(checkpoint_plan_id))) {
-        if (ctx->plan_loaded && strcmp(checkpoint_plan_id, ctx->plan_id) != 0) {
-            free(contents);
-            return set_error(ctx, CAIRN_ERR_PLAN, "checkpoint plan_id does not match loaded plan");
-        }
-    }
-    if (parse_json_u64(contents, "step", &parsed)) {
-        ctx->step = parsed;
-    }
-    if (parse_json_u64(contents, "token_offset", &parsed)) {
-        ctx->token_offset = parsed;
-    }
+    status = restore_checkpoint_contents(ctx, contents);
     free(contents);
+    if (status != CAIRN_OK) {
+        return status;
+    }
     ctx->checkpoint_loaded = 1;
     return CAIRN_OK;
 }
@@ -894,6 +1077,15 @@ int cairn_should_checkpoint(cairn_context_t *ctx) {
 
 int cairn_save_checkpoint(cairn_context_t *ctx, const char *tag) {
     FILE *file;
+    char step_name[64];
+    char step_dir[CAIRN_PATH_MAX];
+    char ranks_dir[CAIRN_PATH_MAX];
+    char rank_file_name[64];
+    char rank_path[CAIRN_PATH_MAX];
+    char manifest_path[CAIRN_PATH_MAX];
+    char latest_path[CAIRN_PATH_MAX];
+    char manifest_rel[CAIRN_PATH_MAX];
+    int status;
 
     if (ctx == NULL || tag == NULL || tag[0] == '\0') {
         return CAIRN_ERR_INVALID_ARGUMENT;
@@ -904,32 +1096,69 @@ int cairn_save_checkpoint(cairn_context_t *ctx, const char *tag) {
     if (!ctx->plan_loaded) {
         return set_error(ctx, CAIRN_ERR_STATE, "plan must be loaded before checkpointing");
     }
-    file = fopen(tag, "wb");
+
+    if (!ensure_directory(tag)) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint root directory could not be created");
+    }
+    snprintf(step_name, sizeof(step_name), "step_%09llu", (unsigned long long)ctx->step);
+    if (!join_path(step_dir, sizeof(step_dir), tag, step_name)) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint step path is too long");
+    }
+    if (!ensure_directory(step_dir)) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint step directory could not be created");
+    }
+    if (!join_path(ranks_dir, sizeof(ranks_dir), step_dir, "ranks")) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint ranks path is too long");
+    }
+    if (!ensure_directory(ranks_dir)) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint ranks directory could not be created");
+    }
+    snprintf(rank_file_name, sizeof(rank_file_name), "rank_%06u.json", ctx->desc.global_rank);
+    if (!join_path(rank_path, sizeof(rank_path), ranks_dir, rank_file_name)) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint rank shard path is too long");
+    }
+    status = write_rank_checkpoint(ctx, rank_path);
+    if (status != CAIRN_OK) {
+        return status;
+    }
+
+    if (!join_path(manifest_path, sizeof(manifest_path), step_dir, "manifest.json")) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint manifest path is too long");
+    }
+    file = fopen(manifest_path, "wb");
     if (file == NULL) {
-        return set_error(ctx, CAIRN_ERR_IO, "checkpoint file could not be opened for writing");
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint manifest could not be opened for writing");
     }
     fprintf(file, "{\n");
     fprintf(file, "  \"version\": 1,\n");
     fprintf(file, "  \"plan_id\": \"%s\",\n", ctx->plan_id);
-    fprintf(file, "  \"global_rank\": %u,\n", ctx->desc.global_rank);
     fprintf(file, "  \"world_size\": %u,\n", ctx->plan_world_size);
     fprintf(file, "  \"step\": %llu,\n", (unsigned long long)ctx->step);
-    fprintf(file, "  \"token_offset\": %llu,\n", (unsigned long long)ctx->token_offset);
-    fprintf(file, "  \"op_count\": %llu,\n", (unsigned long long)ctx->op_count);
-    fprintf(file, "  \"estimated_memory_bytes\": %llu,\n", (unsigned long long)ctx->estimated_memory_bytes);
-    fprintf(file, "  \"memory_segment_count\": %llu,\n", (unsigned long long)ctx->segment_count);
-    fprintf(file, "  \"arena_bytes\": %llu,\n", (unsigned long long)ctx->arena_bytes);
-    fprintf(file, "  \"arena_allocated\": %s,\n", ctx->arena_allocated ? "true" : "false");
-    fprintf(file, "  \"ops_executed\": %llu,\n", (unsigned long long)ctx->stats.ops_executed);
-    fprintf(file, "  \"compute_ops\": %llu,\n", (unsigned long long)ctx->stats.compute_ops);
-    fprintf(file, "  \"communication_ops\": %llu,\n", (unsigned long long)ctx->stats.communication_ops);
-    fprintf(file, "  \"io_ops\": %llu,\n", (unsigned long long)ctx->stats.io_ops);
-    fprintf(file, "  \"compute_bytes\": %llu,\n", (unsigned long long)ctx->stats.compute_bytes);
-    fprintf(file, "  \"communication_bytes\": %llu,\n", (unsigned long long)ctx->stats.communication_bytes);
-    fprintf(file, "  \"io_bytes\": %llu\n", (unsigned long long)ctx->stats.io_bytes);
+    fprintf(file, "  \"rank_count\": 1,\n");
+    fprintf(file, "  \"rank_shard_path\": \"ranks/%s\"\n", rank_file_name);
     fprintf(file, "}\n");
     if (fclose(file) != 0) {
-        return set_error(ctx, CAIRN_ERR_IO, "checkpoint file could not be closed");
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint manifest could not be closed");
+    }
+
+    if (!join_path(latest_path, sizeof(latest_path), tag, "latest.json")) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint latest path is too long");
+    }
+    if (!join_path(manifest_rel, sizeof(manifest_rel), step_name, "manifest.json")) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint relative manifest path is too long");
+    }
+    file = fopen(latest_path, "wb");
+    if (file == NULL) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint latest manifest could not be opened for writing");
+    }
+    fprintf(file, "{\n");
+    fprintf(file, "  \"version\": 1,\n");
+    fprintf(file, "  \"plan_id\": \"%s\",\n", ctx->plan_id);
+    fprintf(file, "  \"step\": %llu,\n", (unsigned long long)ctx->step);
+    fprintf(file, "  \"manifest_path\": \"%s\"\n", manifest_rel);
+    fprintf(file, "}\n");
+    if (fclose(file) != 0) {
+        return set_error(ctx, CAIRN_ERR_IO, "checkpoint latest manifest could not be closed");
     }
     return CAIRN_OK;
 }

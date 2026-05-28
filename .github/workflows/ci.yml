@@ -41,4 +41,4 @@ jobs:
             --out build/plan
           PYTHONPATH=src python -m cairn simulate build/plan --out build/simulation-report.json
           PYTHONPATH=src python -m cairn report build/simulation-report.json
-          /tmp/cairn-runtime-smoke build/plan/ranks/rank_000000.json 8 /tmp/cairn-checkpoint.json
+          /tmp/cairn-runtime-smoke build/plan/ranks/rank_000000.json 8 /tmp/cairn-checkpoints
