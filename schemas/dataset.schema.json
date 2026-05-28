@@ -4,7 +4,11 @@
   "required": {
     "version": "integer",
     "name": "string",
+    "format": "fixed-token-binary",
     "shards": "non-empty-list"
+  },
+  "optional": {
+    "token_dtype": "uint32|uint16|uint8"
   },
   "shard": {
     "path": "string",

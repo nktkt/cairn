@@ -2,6 +2,7 @@
   "version": 1,
   "name": "synthetic-token-shards",
   "format": "fixed-token-binary",
+  "token_dtype": "uint32",
   "shards": [
     {
       "path": "data/shard_000000.bin",

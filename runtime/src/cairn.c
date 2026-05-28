@@ -51,6 +51,12 @@ typedef struct {
     char segment[64];
 } cairn_tensor_t;
 
+typedef struct {
+    uint64_t tokens;
+    uint64_t nbytes;
+    char path[CAIRN_DATASET_PATH_MAX];
+} cairn_dataset_shard_t;
+
 struct cairn_context {
     cairn_init_desc_t desc;
     char last_error[256];
@@ -76,6 +82,11 @@ struct cairn_context {
     uint64_t tensor_ref_count;
     uint64_t trace_count;
     uint64_t trace_capacity;
+    cairn_dataset_shard_t *dataset_shards;
+    uint64_t dataset_shard_count;
+    uint64_t dataset_total_tokens;
+    uint32_t dataset_token_bytes;
+    int dataset_loaded;
     uint64_t arena_bytes;
     void *arena;
     int arena_allocated;
@@ -117,6 +128,22 @@ static int path_is_directory(const char *path) {
     return S_ISDIR(info.st_mode) ? 1 : 0;
 }
 
+static int file_size_bytes(const char *path, uint64_t *out_size) {
+    struct stat info;
+
+    if (out_size != NULL) {
+        *out_size = 0;
+    }
+    if (path == NULL || path[0] == '\0' || out_size == NULL) {
+        return 0;
+    }
+    if (stat(path, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size < 0) {
+        return 0;
+    }
+    *out_size = (uint64_t)info.st_size;
+    return 1;
+}
+
 static int ensure_directory(const char *path) {
     if (path == NULL || path[0] == '\0') {
         return 0;
@@ -144,6 +171,19 @@ static int join_path(char *out, size_t out_size, const char *left, const char *r
         written = snprintf(out, out_size, "%s/%s", left, right);
     }
     return written > 0 && (size_t)written < out_size;
+}
+
+static int resolve_path(char *out, size_t out_size, const char *base_dir, const char *path) {
+    if (out == NULL || out_size == 0 || path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    if (path[0] == '/') {
+        return snprintf(out, out_size, "%s", path) > 0 && strlen(path) < out_size;
+    }
+    if (base_dir == NULL || base_dir[0] == '\0') {
+        base_dir = ".";
+    }
+    return join_path(out, out_size, base_dir, path);
 }
 
 static int dirname_of(char *out, size_t out_size, const char *path) {
@@ -488,6 +528,19 @@ static int tensor_fits_segment(
     return 0;
 }
 
+static uint32_t dataset_token_bytes_for_dtype(const char *dtype) {
+    if (dtype == NULL || dtype[0] == '\0' || strcmp(dtype, "uint32") == 0) {
+        return 4;
+    }
+    if (strcmp(dtype, "uint16") == 0) {
+        return 2;
+    }
+    if (strcmp(dtype, "uint8") == 0) {
+        return 1;
+    }
+    return 0;
+}
+
 static const char *find_matching_bracket(const char *open) {
     const char *cursor;
     int depth;
@@ -807,6 +860,123 @@ static int parse_memory_segments(
     return 1;
 }
 
+static int parse_dataset_shards(
+    const char *json,
+    const char *manifest_dir,
+    uint32_t token_bytes,
+    cairn_dataset_shard_t **out_shards,
+    uint64_t *out_count,
+    uint64_t *out_total_tokens
+) {
+    const char *shards_start;
+    const char *shards_end;
+    const char *cursor;
+    uint64_t count;
+    uint64_t index;
+    uint64_t total_tokens;
+    cairn_dataset_shard_t *shards;
+
+    if (out_shards == NULL || out_count == NULL || out_total_tokens == NULL || token_bytes == 0) {
+        return 0;
+    }
+    *out_shards = NULL;
+    *out_count = 0;
+    *out_total_tokens = 0;
+
+    shards_start = find_json_array(json, "shards", &shards_end);
+    if (shards_start == NULL || shards_end == NULL || shards_end <= shards_start) {
+        return 0;
+    }
+
+    count = count_occurrences_range(shards_start, shards_end, "\"path\"");
+    if (count == 0 || (uint64_t)((size_t)count) != count) {
+        return 0;
+    }
+    shards = (cairn_dataset_shard_t *)calloc((size_t)count, sizeof(cairn_dataset_shard_t));
+    if (shards == NULL) {
+        return 0;
+    }
+
+    cursor = shards_start;
+    index = 0;
+    total_tokens = 0;
+    while ((cursor = strstr(cursor, "\"path\"")) != NULL && cursor < shards_end) {
+        const char *object_start;
+        const char *object_end;
+        char *object_json;
+        char relative_path[CAIRN_DATASET_PATH_MAX];
+        uint64_t expected_nbytes;
+        uint64_t actual_nbytes;
+        uint64_t tokens;
+
+        if (index >= count) {
+            free(shards);
+            return 0;
+        }
+
+        object_start = reverse_find_char(shards_start, cursor, '{');
+        object_end = strchr(cursor, '}');
+        if (object_start == NULL || object_end == NULL || object_end > shards_end) {
+            free(shards);
+            return 0;
+        }
+        object_json = copy_range(object_start, object_end);
+        if (object_json == NULL) {
+            free(shards);
+            return 0;
+        }
+
+        if (!parse_json_string(object_json, "path", relative_path, sizeof(relative_path))) {
+            free(object_json);
+            free(shards);
+            return 0;
+        }
+        if (!resolve_path(shards[index].path, sizeof(shards[index].path), manifest_dir, relative_path)) {
+            free(object_json);
+            free(shards);
+            return 0;
+        }
+        if (!parse_json_u64(object_json, "tokens", &tokens) || tokens == 0) {
+            free(object_json);
+            free(shards);
+            return 0;
+        }
+        if (tokens > UINT64_MAX / token_bytes) {
+            free(object_json);
+            free(shards);
+            return 0;
+        }
+        expected_nbytes = tokens * token_bytes;
+        if (!file_size_bytes(shards[index].path, &actual_nbytes) || actual_nbytes != expected_nbytes) {
+            free(object_json);
+            free(shards);
+            return 0;
+        }
+        if (UINT64_MAX - total_tokens < tokens) {
+            free(object_json);
+            free(shards);
+            return 0;
+        }
+
+        shards[index].tokens = tokens;
+        shards[index].nbytes = actual_nbytes;
+        total_tokens += tokens;
+        free(object_json);
+        index++;
+        cursor = object_end + 1;
+    }
+
+    if (index != count || total_tokens == 0) {
+        free(shards);
+        return 0;
+    }
+
+    *out_shards = shards;
+    *out_count = count;
+    *out_total_tokens = total_tokens;
+    return 1;
+}
+
 static int reserve_arena(cairn_context_t *ctx, uint64_t arena_bytes) {
     const char *allocate_host_arena;
 
@@ -929,6 +1099,10 @@ static int write_rank_checkpoint(cairn_context_t *ctx, const char *path) {
     fprintf(file, "  \"tensor_count\": %llu,\n", (unsigned long long)ctx->tensor_count);
     fprintf(file, "  \"dependency_ref_count\": %llu,\n", (unsigned long long)ctx->dependency_ref_count);
     fprintf(file, "  \"tensor_ref_count\": %llu,\n", (unsigned long long)ctx->tensor_ref_count);
+    fprintf(file, "  \"dataset_loaded\": %s,\n", ctx->dataset_loaded ? "true" : "false");
+    fprintf(file, "  \"dataset_shard_count\": %llu,\n", (unsigned long long)ctx->dataset_shard_count);
+    fprintf(file, "  \"dataset_total_tokens\": %llu,\n", (unsigned long long)ctx->dataset_total_tokens);
+    fprintf(file, "  \"dataset_token_bytes\": %u,\n", ctx->dataset_token_bytes);
     fprintf(file, "  \"arena_bytes\": %llu,\n", (unsigned long long)ctx->arena_bytes);
     fprintf(file, "  \"arena_allocated\": %s,\n", ctx->arena_allocated ? "true" : "false");
     fprintf(file, "  \"ops_executed\": %llu,\n", (unsigned long long)ctx->stats.ops_executed);
@@ -988,6 +1162,18 @@ static void clear_plan(cairn_context_t *ctx) {
     ctx->plan_id[0] = '\0';
     memset(&ctx->stats, 0, sizeof(ctx->stats));
     ctx->plan_loaded = 0;
+}
+
+static void clear_dataset(cairn_context_t *ctx) {
+    if (ctx == NULL) {
+        return;
+    }
+    free(ctx->dataset_shards);
+    ctx->dataset_shards = NULL;
+    ctx->dataset_shard_count = 0;
+    ctx->dataset_total_tokens = 0;
+    ctx->dataset_token_bytes = 0;
+    ctx->dataset_loaded = 0;
 }
 
 static int fail_binary_plan(
@@ -1402,6 +1588,11 @@ int cairn_init(cairn_context_t **ctx, const cairn_init_desc_t *desc) {
     created->tensor_ref_count = 0;
     created->trace_count = 0;
     created->trace_capacity = 0;
+    created->dataset_shards = NULL;
+    created->dataset_shard_count = 0;
+    created->dataset_total_tokens = 0;
+    created->dataset_token_bytes = 0;
+    created->dataset_loaded = 0;
     created->arena_bytes = 0;
     created->arena = NULL;
     created->arena_allocated = 0;
@@ -1544,6 +1735,78 @@ int cairn_load_plan(cairn_context_t *ctx, const char *path) {
     return CAIRN_OK;
 }
 
+int cairn_load_dataset(cairn_context_t *ctx, const char *path) {
+    char *contents;
+    size_t contents_size;
+    char manifest_dir[CAIRN_PATH_MAX];
+    char format[32];
+    char token_dtype[32];
+    uint64_t parsed;
+    uint32_t token_bytes;
+    cairn_dataset_shard_t *loaded_shards;
+    uint64_t loaded_shard_count;
+    uint64_t loaded_total_tokens;
+
+    if (ctx == NULL || path == NULL) {
+        return CAIRN_ERR_INVALID_ARGUMENT;
+    }
+    if (ctx->finalized) {
+        return set_error(ctx, CAIRN_ERR_STATE, "context is finalized");
+    }
+    if (!file_exists(path)) {
+        return set_error(ctx, CAIRN_ERR_IO, "dataset manifest file does not exist");
+    }
+
+    contents = read_file(path, &contents_size);
+    if (contents == NULL || contents_size == 0) {
+        free(contents);
+        return set_error(ctx, CAIRN_ERR_IO, "dataset manifest could not be read");
+    }
+    if (!parse_json_u64(contents, "version", &parsed) || parsed != 1) {
+        free(contents);
+        return set_error(ctx, CAIRN_ERR_PLAN, "dataset manifest version is invalid");
+    }
+    if (!parse_json_string(contents, "format", format, sizeof(format)) || strcmp(format, "fixed-token-binary") != 0) {
+        free(contents);
+        return set_error(ctx, CAIRN_ERR_PLAN, "dataset format must be fixed-token-binary");
+    }
+    if (!parse_json_string(contents, "token_dtype", token_dtype, sizeof(token_dtype))) {
+        snprintf(token_dtype, sizeof(token_dtype), "uint32");
+    }
+    token_bytes = dataset_token_bytes_for_dtype(token_dtype);
+    if (token_bytes == 0) {
+        free(contents);
+        return set_error(ctx, CAIRN_ERR_PLAN, "dataset token_dtype is unsupported");
+    }
+    if (!dirname_of(manifest_dir, sizeof(manifest_dir), path)) {
+        free(contents);
+        return set_error(ctx, CAIRN_ERR_IO, "dataset manifest directory is invalid");
+    }
+
+    loaded_shards = NULL;
+    loaded_shard_count = 0;
+    loaded_total_tokens = 0;
+    if (!parse_dataset_shards(
+            contents,
+            manifest_dir,
+            token_bytes,
+            &loaded_shards,
+            &loaded_shard_count,
+            &loaded_total_tokens)) {
+        free(contents);
+        return set_error(ctx, CAIRN_ERR_PLAN, "dataset shards are missing, invalid, or do not match binary size");
+    }
+    free(contents);
+
+    clear_dataset(ctx);
+    ctx->dataset_shards = loaded_shards;
+    ctx->dataset_shard_count = loaded_shard_count;
+    ctx->dataset_total_tokens = loaded_total_tokens;
+    ctx->dataset_token_bytes = token_bytes;
+    ctx->dataset_loaded = 1;
+    return CAIRN_OK;
+}
+
 int cairn_load_checkpoint(cairn_context_t *ctx, const char *path) {
     char *contents;
     size_t contents_size;
@@ -1633,10 +1896,45 @@ int cairn_next_batch(cairn_context_t *ctx, cairn_batch_t *batch) {
     if (!ctx->plan_loaded) {
         return set_error(ctx, CAIRN_ERR_STATE, "plan must be loaded before requesting batches");
     }
+    if (!ctx->dataset_loaded && ctx->desc.dataset_manifest_path != NULL && ctx->desc.dataset_manifest_path[0] != '\0') {
+        int status = cairn_load_dataset(ctx, ctx->desc.dataset_manifest_path);
+        if (status != CAIRN_OK) {
+            return status;
+        }
+    }
 
     batch->step = ctx->step;
     batch->token_offset = ctx->token_offset;
     batch->microbatch_size = ctx->plan_microbatch_size;
+    batch->shard_index = 0;
+    batch->shard_token_offset = ctx->token_offset;
+    batch->tokens_available = UINT64_MAX;
+    batch->shard_path[0] = '\0';
+
+    if (ctx->dataset_loaded) {
+        uint64_t cursor;
+        uint64_t shard_index;
+
+        if (ctx->dataset_total_tokens == 0 || ctx->dataset_shard_count == 0 || ctx->dataset_shards == NULL) {
+            return set_error(ctx, CAIRN_ERR_STATE, "dataset is loaded but has no shards");
+        }
+        cursor = ctx->token_offset % ctx->dataset_total_tokens;
+        for (shard_index = 0; shard_index < ctx->dataset_shard_count; shard_index++) {
+            const cairn_dataset_shard_t *shard = &ctx->dataset_shards[shard_index];
+
+            if (cursor < shard->tokens) {
+                batch->shard_index = (uint32_t)shard_index;
+                batch->shard_token_offset = cursor;
+                batch->tokens_available = shard->tokens - cursor;
+                snprintf(batch->shard_path, sizeof(batch->shard_path), "%s", shard->path);
+                break;
+            }
+            cursor -= shard->tokens;
+        }
+        if (batch->shard_path[0] == '\0') {
+            return set_error(ctx, CAIRN_ERR_STATE, "dataset cursor could not be resolved to a shard");
+        }
+    }
     return CAIRN_OK;
 }
 
@@ -2016,6 +2314,7 @@ int cairn_finalize(cairn_context_t *ctx) {
     ctx->dependency_refs = NULL;
     free(ctx->tensor_refs);
     ctx->tensor_refs = NULL;
+    clear_dataset(ctx);
     free(ctx->trace_events);
     ctx->trace_events = NULL;
     free(ctx->scheduler_marks);
@@ -2089,6 +2388,27 @@ uint64_t cairn_memory_arena_bytes(const cairn_context_t *ctx) {
         return 0;
     }
     return ctx->arena_bytes;
+}
+
+uint64_t cairn_dataset_shard_count(const cairn_context_t *ctx) {
+    if (ctx == NULL) {
+        return 0;
+    }
+    return ctx->dataset_shard_count;
+}
+
+uint64_t cairn_dataset_total_tokens(const cairn_context_t *ctx) {
+    if (ctx == NULL) {
+        return 0;
+    }
+    return ctx->dataset_total_tokens;
+}
+
+uint32_t cairn_dataset_token_bytes(const cairn_context_t *ctx) {
+    if (ctx == NULL) {
+        return 0;
+    }
+    return ctx->dataset_token_bytes;
 }
 
 uint64_t cairn_current_step(const cairn_context_t *ctx) {

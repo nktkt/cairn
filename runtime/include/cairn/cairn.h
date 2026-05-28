@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+#define CAIRN_DATASET_PATH_MAX 1024
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,7 +24,11 @@ typedef struct {
 typedef struct {
     uint64_t step;
     uint64_t token_offset;
+    uint64_t shard_token_offset;
+    uint64_t tokens_available;
     uint32_t microbatch_size;
+    uint32_t shard_index;
+    char shard_path[CAIRN_DATASET_PATH_MAX];
 } cairn_batch_t;
 
 typedef enum {
@@ -62,6 +68,7 @@ typedef struct {
 
 int cairn_init(cairn_context_t **ctx, const cairn_init_desc_t *desc);
 int cairn_load_plan(cairn_context_t *ctx, const char *path);
+int cairn_load_dataset(cairn_context_t *ctx, const char *path);
 int cairn_load_checkpoint(cairn_context_t *ctx, const char *path);
 int cairn_next_batch(cairn_context_t *ctx, cairn_batch_t *batch);
 int cairn_train_step(cairn_context_t *ctx, const cairn_batch_t *batch);
@@ -81,6 +88,9 @@ uint64_t cairn_plan_tensor_count(const cairn_context_t *ctx);
 uint64_t cairn_plan_dependency_ref_count(const cairn_context_t *ctx);
 uint64_t cairn_plan_tensor_ref_count(const cairn_context_t *ctx);
 uint64_t cairn_memory_arena_bytes(const cairn_context_t *ctx);
+uint64_t cairn_dataset_shard_count(const cairn_context_t *ctx);
+uint64_t cairn_dataset_total_tokens(const cairn_context_t *ctx);
+uint32_t cairn_dataset_token_bytes(const cairn_context_t *ctx);
 uint64_t cairn_current_step(const cairn_context_t *ctx);
 
 #ifdef __cplusplus

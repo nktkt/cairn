@@ -39,7 +39,7 @@ The current implementation includes:
 - `cairn simulate` for pipeline, memory, communication, checkpoint, and failure-injection reports
 - `cairn report` for compact report summaries
 - a shared op registry used by both the Python compiler and C runtime
-- a C ABI/runtime dry-run skeleton that loads rank plans, validates memory segments, tensor placement, dependency edges, op classes, and registry hashes, reserves arena metadata, executes dependency-aware op schedules, records stats, writes JSONL traces, and writes checkpoint manifests
+- a C ABI/runtime dry-run skeleton that loads rank plans and fixed-token binary dataset manifests, validates memory segments, tensor placement, dependency edges, op classes, registry hashes, and shard sizes, reserves arena metadata, executes dependency-aware op schedules, records stats, writes JSONL traces, and writes checkpoint manifests
 - small example specs under [examples/small](examples/small)
 - unit tests and GitHub Actions CI
 
@@ -95,6 +95,8 @@ cc -std=c11 -Wall -Wextra -Werror \
   /tmp/cairn-checkpoints \
   /tmp/cairn-trace.jsonl
 ```
+
+The smoke binary also accepts an optional dataset manifest after `TRACE_OUT`. The manifest must use `format: fixed-token-binary`; relative shard paths are resolved from the manifest directory and checked against the declared token count and token dtype.
 
 The restore smoke binary verifies that a checkpoint root can be restored through `latest.json`:
 

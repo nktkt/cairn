@@ -174,6 +174,10 @@ def validate_dataset(dataset: dict[str, Any]) -> ValidationReport:
         report.error("dataset.version: expected 1")
     if not isinstance(dataset.get("name"), str) or not dataset["name"]:
         report.error("dataset.name: expected non-empty string")
+    if dataset.get("format") != "fixed-token-binary":
+        report.error("dataset.format: expected fixed-token-binary")
+    if dataset.get("token_dtype", "uint32") not in ("uint32", "uint16", "uint8"):
+        report.error("dataset.token_dtype: expected one of uint32, uint16, uint8")
     shards = dataset.get("shards")
     if not isinstance(shards, list) or not shards:
         report.error("dataset.shards: expected non-empty list")

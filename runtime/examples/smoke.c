@@ -26,10 +26,12 @@ int main(int argc, char **argv) {
     unsigned long long tensor_count;
     unsigned long long dependency_count;
     unsigned long long tensor_ref_count;
+    unsigned long long dataset_shard_count;
+    unsigned long long dataset_total_tokens;
     unsigned long long arena_bytes;
 
-    if (argc != 4 && argc != 5) {
-        fprintf(stderr, "usage: %s RANK_PLAN WORLD_SIZE CHECKPOINT_OUT [TRACE_OUT]\n", argv[0]);
+    if (argc < 4 || argc > 6) {
+        fprintf(stderr, "usage: %s RANK_PLAN WORLD_SIZE CHECKPOINT_OUT [TRACE_OUT] [DATASET_MANIFEST]\n", argv[0]);
         return 2;
     }
     if (sscanf(argv[2], "%u", &world_size) != 1 || world_size == 0) {
@@ -43,12 +45,16 @@ int main(int argc, char **argv) {
     desc.plan_path = argv[1];
     desc.topology_path = NULL;
     desc.checkpoint_path = NULL;
-    desc.dataset_manifest_path = NULL;
+    desc.dataset_manifest_path = argc == 6 ? argv[5] : NULL;
 
     if (expect_ok(cairn_init(&ctx, &desc), "cairn_init", ctx)) {
         return 1;
     }
     if (expect_ok(cairn_load_plan(ctx, argv[1]), "cairn_load_plan", ctx)) {
+        cairn_finalize(ctx);
+        return 1;
+    }
+    if (argc == 6 && expect_ok(cairn_load_dataset(ctx, argv[5]), "cairn_load_dataset", ctx)) {
         cairn_finalize(ctx);
         return 1;
     }
@@ -76,6 +82,18 @@ int main(int argc, char **argv) {
     if (expect_ok(cairn_next_batch(ctx, &batch), "cairn_next_batch", ctx)) {
         cairn_finalize(ctx);
         return 1;
+    }
+    if (argc == 6) {
+        if (cairn_dataset_shard_count(ctx) == 0 || cairn_dataset_total_tokens(ctx) == 0 || cairn_dataset_token_bytes(ctx) == 0) {
+            fprintf(stderr, "dataset manifest was not loaded\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
+        if (batch.shard_path[0] == '\0' || batch.tokens_available == 0) {
+            fprintf(stderr, "dataset batch cursor was not populated\n");
+            cairn_finalize(ctx);
+            return 1;
+        }
     }
     if (expect_ok(cairn_train_step(ctx, &batch), "cairn_train_step", ctx)) {
         cairn_finalize(ctx);
@@ -122,7 +140,7 @@ int main(int argc, char **argv) {
         cairn_finalize(ctx);
         return 1;
     }
-    if (argc == 5 && expect_ok(cairn_write_trace(ctx, argv[4]), "cairn_write_trace", ctx)) {
+    if (argc >= 5 && expect_ok(cairn_write_trace(ctx, argv[4]), "cairn_write_trace", ctx)) {
         cairn_finalize(ctx);
         return 1;
     }
@@ -133,6 +151,8 @@ int main(int argc, char **argv) {
     tensor_count = (unsigned long long)cairn_plan_tensor_count(ctx);
     dependency_count = (unsigned long long)cairn_plan_dependency_ref_count(ctx);
     tensor_ref_count = (unsigned long long)cairn_plan_tensor_ref_count(ctx);
+    dataset_shard_count = (unsigned long long)cairn_dataset_shard_count(ctx);
+    dataset_total_tokens = (unsigned long long)cairn_dataset_total_tokens(ctx);
     arena_bytes = (unsigned long long)cairn_memory_arena_bytes(ctx);
     if (expect_ok(cairn_finalize(ctx), "cairn_finalize", ctx)) {
         return 1;
@@ -158,7 +178,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("cairn runtime smoke ok plan=%s ops=%llu memory=%llu segments=%llu tensors=%llu deps=%llu tensor_refs=%llu arena=%llu\n",
+    printf("cairn runtime smoke ok plan=%s ops=%llu memory=%llu segments=%llu tensors=%llu deps=%llu tensor_refs=%llu dataset_shards=%llu dataset_tokens=%llu arena=%llu\n",
            plan_id,
            op_count,
            memory_bytes,
@@ -166,6 +186,8 @@ int main(int argc, char **argv) {
            tensor_count,
            dependency_count,
            tensor_ref_count,
+           dataset_shard_count,
+           dataset_total_tokens,
            arena_bytes);
     return 0;
 }

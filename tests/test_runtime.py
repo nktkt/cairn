@@ -29,6 +29,29 @@ class RuntimeSmokeTests(unittest.TestCase):
             restore_binary = temp_path / "runtime-restore"
             checkpoint = temp_path / "checkpoint"
             trace_path = temp_path / "trace.jsonl"
+            dataset_manifest = temp_path / "dataset.json"
+            data_dir = temp_path / "data"
+            data_dir.mkdir()
+            for shard_id in range(2):
+                shard_tokens = b"".join((token + (shard_id * 8)).to_bytes(4, "little") for token in range(8))
+                (data_dir / f"shard_{shard_id:06d}.bin").write_bytes(shard_tokens)
+            dataset_manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "name": "runtime-smoke-dataset",
+                        "format": "fixed-token-binary",
+                        "token_dtype": "uint32",
+                        "shards": [
+                            {"path": "data/shard_000000.bin", "tokens": 8},
+                            {"path": "data/shard_000001.bin", "tokens": 8},
+                        ],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
             compile_plan(
                 model=load_example("model"),
                 training=load_example("training"),
@@ -81,7 +104,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(restore_compile_result.returncode, 0, restore_compile_result.stderr)
 
             run_result = subprocess.run(
-                [str(binary), str(binary_plan), "8", str(checkpoint), str(trace_path)],
+                [str(binary), str(binary_plan), "8", str(checkpoint), str(trace_path), str(dataset_manifest)],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
@@ -94,6 +117,8 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertIn("tensors=8", run_result.stdout)
             self.assertIn("deps=16", run_result.stdout)
             self.assertIn("tensor_refs=", run_result.stdout)
+            self.assertIn("dataset_shards=2", run_result.stdout)
+            self.assertIn("dataset_tokens=16", run_result.stdout)
             self.assertTrue(trace_path.exists())
             trace_lines = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(len(trace_lines), 17)
@@ -122,6 +147,10 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(checkpoint_data["dependency_ref_count"], 16)
             self.assertGreater(checkpoint_data["tensor_ref_count"], 0)
             self.assertEqual(checkpoint_data["trace_event_count"], 17)
+            self.assertTrue(checkpoint_data["dataset_loaded"])
+            self.assertEqual(checkpoint_data["dataset_shard_count"], 2)
+            self.assertEqual(checkpoint_data["dataset_total_tokens"], 16)
+            self.assertEqual(checkpoint_data["dataset_token_bytes"], 4)
             self.assertGreaterEqual(checkpoint_data["arena_bytes"], checkpoint_data["estimated_memory_bytes"])
             self.assertGreater(checkpoint_data["compute_ops"], 0)
             self.assertGreater(checkpoint_data["communication_ops"], 0)
@@ -287,6 +316,38 @@ class RuntimeSmokeTests(unittest.TestCase):
             )
             self.assertNotEqual(bad_binary_dep_result.returncode, 0)
             self.assertIn("dependencies", bad_binary_dep_result.stderr)
+
+            bad_dataset_manifest = temp_path / "bad-dataset.json"
+            bad_dataset_manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "name": "bad-runtime-smoke-dataset",
+                        "format": "fixed-token-binary",
+                        "token_dtype": "uint32",
+                        "shards": [{"path": "data/shard_000000.bin", "tokens": 9}],
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            bad_dataset_result = subprocess.run(
+                [
+                    str(binary),
+                    str(binary_plan),
+                    "8",
+                    str(temp_path / "bad-dataset-checkpoint"),
+                    str(temp_path / "bad-dataset-trace.jsonl"),
+                    str(bad_dataset_manifest),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(bad_dataset_result.returncode, 0)
+            self.assertIn("dataset", bad_dataset_result.stderr)
 
 
 if __name__ == "__main__":
