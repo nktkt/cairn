@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,18 @@ STREAMS = {
     "comm_dp": 4,
     "io": 5,
 }
+
+OP_CLASS_IDS = {
+    "compute": 0,
+    "communication": 1,
+    "io": 2,
+}
+
+BINARY_PLAN_MAGIC = b"CAIRNPLN"
+BINARY_PLAN_VERSION = 1
+BINARY_PLAN_HEADER = struct.Struct("<8sII64s64sIIIIIQQ")
+BINARY_PLAN_SEGMENT = struct.Struct("<64sQQ")
+BINARY_PLAN_OP = struct.Struct("<II48s32sQ")
 
 
 def compile_plan(
@@ -83,12 +96,15 @@ def compile_plan(
             "memory_layout": "memory-layout.json",
             "validation_report": "validation-report.json",
             "rank_plans_dir": "ranks",
+            "rank_binary_plans_dir": "ranks-bin",
         },
     }
 
     out_dir.mkdir(parents=True, exist_ok=True)
     ranks_dir = out_dir / "ranks"
+    rank_binary_dir = out_dir / "ranks-bin"
     ranks_dir.mkdir(parents=True, exist_ok=True)
+    rank_binary_dir.mkdir(parents=True, exist_ok=True)
 
     write_json(out_dir / "manifest.json", manifest)
     write_json(out_dir / "rank-map.json", rank_map)
@@ -109,6 +125,7 @@ def compile_plan(
             op_registry=op_registry,
         )
         write_json(ranks_dir / f"rank_{rank['global_rank']:06d}.json", rank_plan)
+        write_binary_rank_plan(rank_binary_dir / f"rank_{rank['global_rank']:06d}.cairn", rank_plan)
 
     return manifest
 
@@ -237,3 +254,58 @@ def activation_bytes(model: dict[str, Any], training: dict[str, Any]) -> int:
 def gradient_bytes(model: dict[str, Any], training: dict[str, Any]) -> int:
     dtype_size = 1 if training["precision"] == "fp8" else 2
     return model["hidden_size"] * model["hidden_size"] * dtype_size // max(1, training["parallelism"]["tensor"])
+
+
+def write_binary_rank_plan(path: Path, rank_plan: dict[str, Any]) -> None:
+    segments = rank_plan["memory"]["segments"]
+    ops = rank_plan["ops"]
+    arena_bytes = arena_bytes_from_segments(segments)
+    chunks = [
+        BINARY_PLAN_HEADER.pack(
+            BINARY_PLAN_MAGIC,
+            BINARY_PLAN_VERSION,
+            rank_plan["op_registry_version"],
+            fixed_bytes(rank_plan["op_registry_sha256"], 64),
+            fixed_bytes(rank_plan["plan_id"], 64),
+            rank_plan["world_size"],
+            rank_plan["rank"]["global_rank"],
+            rank_plan["microbatch_size"],
+            len(ops),
+            len(segments),
+            rank_plan["memory"]["estimated_bytes_per_rank"],
+            arena_bytes,
+        )
+    ]
+    for segment in segments:
+        chunks.append(
+            BINARY_PLAN_SEGMENT.pack(
+                fixed_bytes(segment["name"], 64),
+                segment["offset"],
+                segment["nbytes"],
+            )
+        )
+    for item in ops:
+        chunks.append(
+            BINARY_PLAN_OP.pack(
+                item["op_id"],
+                OP_CLASS_IDS[item["op_class"]],
+                fixed_bytes(item["kind"], 48),
+                fixed_bytes(item["stream"], 32),
+                item.get("bytes", 0),
+            )
+        )
+    path.write_bytes(b"".join(chunks))
+
+
+def fixed_bytes(value: str, size: int) -> bytes:
+    encoded = value.encode("ascii")
+    if len(encoded) > size:
+        raise ValueError(f"value is too long for fixed field of {size} bytes: {value}")
+    return encoded + (b"\0" * (size - len(encoded)))
+
+
+def arena_bytes_from_segments(segments: list[dict[str, Any]]) -> int:
+    arena_bytes = 0
+    for segment in segments:
+        arena_bytes = max(arena_bytes, segment["offset"] + segment["nbytes"])
+    return arena_bytes

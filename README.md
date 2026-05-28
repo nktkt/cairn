@@ -35,7 +35,7 @@ The current implementation includes:
 
 - `cairn validate` for model, training, topology, dataset, and checkpoint specs
 - `cairn map` for deterministic physical/logical rank mapping
-- `cairn compile` for deterministic static plan generation
+- `cairn compile` for deterministic static plan generation, including inspectable JSON rank plans and C-runtime `.cairn` rank binaries
 - `cairn simulate` for pipeline, memory, communication, checkpoint, and failure-injection reports
 - `cairn report` for compact report summaries
 - a shared op registry used by both the Python compiler and C runtime
@@ -90,7 +90,7 @@ cc -std=c11 -Wall -Wextra -Werror \
   -o /tmp/cairn-runtime-smoke
 
 /tmp/cairn-runtime-smoke \
-  build/plan/ranks/rank_000000.json \
+  build/plan/ranks-bin/rank_000000.cairn \
   8 \
   /tmp/cairn-checkpoints
 ```
@@ -105,7 +105,7 @@ cc -std=c11 -Wall -Wextra -Werror \
   -o /tmp/cairn-runtime-restore
 
 /tmp/cairn-runtime-restore \
-  build/plan/ranks/rank_000000.json \
+  build/plan/ranks-bin/rank_000000.cairn \
   8 \
   /tmp/cairn-checkpoints
 ```
@@ -151,6 +151,11 @@ See the full design here:
 See the long-horizon product roadmap here:
 
 - [ROADMAP.md](ROADMAP.md)
+
+Architecture decisions:
+
+- [ADR 0001: Static Plan Compiler](docs/adr/0001-static-plan-compiler.md)
+- [ADR 0002: Deterministic Binary Rank Plan Artifact](docs/adr/0002-binary-rank-plan-artifact.md)
 
 ## Scope
 

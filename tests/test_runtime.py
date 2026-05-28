@@ -36,6 +36,8 @@ class RuntimeSmokeTests(unittest.TestCase):
                 checkpoint=load_example("checkpoint"),
                 out_dir=plan_dir,
             )
+            json_plan = plan_dir / "ranks" / "rank_000000.json"
+            binary_plan = plan_dir / "ranks-bin" / "rank_000000.cairn"
             compile_result = subprocess.run(
                 [
                     "cc",
@@ -78,7 +80,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(restore_compile_result.returncode, 0, restore_compile_result.stderr)
 
             run_result = subprocess.run(
-                [str(binary), str(plan_dir / "ranks" / "rank_000000.json"), "8", str(checkpoint)],
+                [str(binary), str(binary_plan), "8", str(checkpoint)],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
@@ -110,7 +112,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertGreater(checkpoint_data["communication_bytes"], 0)
             self.assertGreater(checkpoint_data["io_bytes"], 0)
             restore_result = subprocess.run(
-                [str(restore_binary), str(plan_dir / "ranks" / "rank_000000.json"), "8", str(checkpoint)],
+                [str(restore_binary), str(binary_plan), "8", str(checkpoint)],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
@@ -128,7 +130,7 @@ class RuntimeSmokeTests(unittest.TestCase):
                 encoding="utf-8",
             )
             incomplete_result = subprocess.run(
-                [str(restore_binary), str(plan_dir / "ranks" / "rank_000000.json"), "8", str(incomplete_checkpoint)],
+                [str(restore_binary), str(binary_plan), "8", str(incomplete_checkpoint)],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
@@ -150,7 +152,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             incomplete_manifest_result = subprocess.run(
                 [
                     str(restore_binary),
-                    str(plan_dir / "ranks" / "rank_000000.json"),
+                    str(binary_plan),
                     "8",
                     str(incomplete_manifest_checkpoint),
                 ],
@@ -163,7 +165,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertIn("incomplete", incomplete_manifest_result.stderr)
 
             mismatch_result = subprocess.run(
-                [str(binary), str(plan_dir / "ranks" / "rank_000000.json"), "7", str(temp_path / "bad-checkpoint")],
+                [str(binary), str(binary_plan), "7", str(temp_path / "bad-checkpoint")],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
@@ -173,7 +175,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertIn("world_size does not match", mismatch_result.stderr)
 
             bad_plan = temp_path / "bad-rank-plan.json"
-            bad_plan_data = load_json(plan_dir / "ranks" / "rank_000000.json")
+            bad_plan_data = load_json(json_plan)
             bad_plan_data["memory"]["segments"][1]["offset"] = 1
             bad_plan.write_text(json.dumps(bad_plan_data, indent=2, sort_keys=True), encoding="utf-8")
             bad_memory_result = subprocess.run(
@@ -187,7 +189,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertIn("memory segments", bad_memory_result.stderr)
 
             bad_kind = temp_path / "bad-kind-plan.json"
-            bad_kind_data = load_json(plan_dir / "ranks" / "rank_000000.json")
+            bad_kind_data = load_json(json_plan)
             bad_kind_data["ops"][0]["kind"] = "unknown_kernel"
             bad_kind.write_text(json.dumps(bad_kind_data, indent=2, sort_keys=True), encoding="utf-8")
             bad_kind_result = subprocess.run(
@@ -201,7 +203,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertIn("op table", bad_kind_result.stderr)
 
             bad_stream = temp_path / "bad-stream-plan.json"
-            bad_stream_data = load_json(plan_dir / "ranks" / "rank_000000.json")
+            bad_stream_data = load_json(json_plan)
             bad_stream_data["ops"][0]["stream"] = "comm_dp"
             bad_stream.write_text(json.dumps(bad_stream_data, indent=2, sort_keys=True), encoding="utf-8")
             bad_stream_result = subprocess.run(
@@ -215,7 +217,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertIn("op table", bad_stream_result.stderr)
 
             bad_registry = temp_path / "bad-registry-plan.json"
-            bad_registry_data = load_json(plan_dir / "ranks" / "rank_000000.json")
+            bad_registry_data = load_json(json_plan)
             bad_registry_data["op_registry_sha256"] = "0" * 64
             bad_registry.write_text(json.dumps(bad_registry_data, indent=2, sort_keys=True), encoding="utf-8")
             bad_registry_result = subprocess.run(
@@ -227,6 +229,20 @@ class RuntimeSmokeTests(unittest.TestCase):
             )
             self.assertNotEqual(bad_registry_result.returncode, 0)
             self.assertIn("op registry hash", bad_registry_result.stderr)
+
+            bad_binary_registry = temp_path / "bad-registry-plan.cairn"
+            bad_binary_data = bytearray(binary_plan.read_bytes())
+            bad_binary_data[16:80] = b"0" * 64
+            bad_binary_registry.write_bytes(bad_binary_data)
+            bad_binary_registry_result = subprocess.run(
+                [str(binary), str(bad_binary_registry), "8", str(temp_path / "bad-binary-registry-checkpoint")],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(bad_binary_registry_result.returncode, 0)
+            self.assertIn("op registry hash", bad_binary_registry_result.stderr)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,12 @@
 #include <sys/types.h>
 
 #define CAIRN_PATH_MAX 1024
+#define CAIRN_BINARY_PLAN_MAGIC "CAIRNPLN"
+#define CAIRN_BINARY_PLAN_MAGIC_SIZE 8
+#define CAIRN_BINARY_PLAN_VERSION 1
+#define CAIRN_BINARY_PLAN_HEADER_SIZE 180
+#define CAIRN_BINARY_PLAN_SEGMENT_SIZE 80
+#define CAIRN_BINARY_PLAN_OP_SIZE 96
 
 typedef struct {
     uint64_t op_id;
@@ -178,6 +184,57 @@ static char *read_file(const char *path, size_t *out_size) {
         *out_size = (size_t)size;
     }
     return buffer;
+}
+
+static int has_bytes(size_t size, size_t offset, size_t nbytes) {
+    return offset <= size && nbytes <= size - offset;
+}
+
+static uint32_t read_u32_le(const unsigned char *bytes) {
+    return ((uint32_t)bytes[0])
+         | ((uint32_t)bytes[1] << 8)
+         | ((uint32_t)bytes[2] << 16)
+         | ((uint32_t)bytes[3] << 24);
+}
+
+static uint64_t read_u64_le(const unsigned char *bytes) {
+    return ((uint64_t)bytes[0])
+         | ((uint64_t)bytes[1] << 8)
+         | ((uint64_t)bytes[2] << 16)
+         | ((uint64_t)bytes[3] << 24)
+         | ((uint64_t)bytes[4] << 32)
+         | ((uint64_t)bytes[5] << 40)
+         | ((uint64_t)bytes[6] << 48)
+         | ((uint64_t)bytes[7] << 56);
+}
+
+static int copy_fixed_ascii(char *out, size_t out_size, const unsigned char *source, size_t source_size) {
+    size_t length;
+    size_t index;
+
+    if (out == NULL || out_size == 0 || source == NULL || source_size == 0) {
+        return 0;
+    }
+
+    length = 0;
+    while (length < source_size && source[length] != '\0') {
+        if (source[length] < 32 || source[length] > 126) {
+            return 0;
+        }
+        length++;
+    }
+    if (length == 0 || length + 1 > out_size) {
+        return 0;
+    }
+    memcpy(out, source, length);
+    out[length] = '\0';
+
+    for (index = length + 1; index < source_size; index++) {
+        if (source[index] != '\0') {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 static const char *find_json_key(const char *json, const char *key) {
@@ -812,6 +869,210 @@ static void clear_plan(cairn_context_t *ctx) {
     ctx->plan_loaded = 0;
 }
 
+static int fail_binary_plan(
+    cairn_context_t *ctx,
+    cairn_plan_op_t *ops,
+    cairn_memory_segment_t *segments,
+    const char *message
+) {
+    free(ops);
+    free(segments);
+    return set_error(ctx, CAIRN_ERR_PLAN, message);
+}
+
+static int load_binary_rank_plan(cairn_context_t *ctx, const unsigned char *contents, size_t contents_size) {
+    size_t offset;
+    size_t expected_size;
+    uint32_t binary_version;
+    uint32_t registry_version;
+    uint32_t loaded_world_size;
+    uint32_t loaded_rank;
+    uint32_t loaded_microbatch_size;
+    uint32_t loaded_op_count;
+    uint32_t loaded_segment_count;
+    uint64_t loaded_memory_bytes;
+    uint64_t loaded_arena_bytes;
+    uint64_t computed_arena_bytes;
+    uint64_t previous_end;
+    char loaded_registry_sha[65];
+    char loaded_plan_id[65];
+    cairn_plan_op_t *loaded_ops;
+    cairn_memory_segment_t *loaded_segments;
+    uint32_t index;
+
+    if (ctx == NULL || contents == NULL) {
+        return CAIRN_ERR_INVALID_ARGUMENT;
+    }
+    if (!has_bytes(contents_size, 0, CAIRN_BINARY_PLAN_HEADER_SIZE)) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan header is incomplete");
+    }
+    if (memcmp(contents, CAIRN_BINARY_PLAN_MAGIC, CAIRN_BINARY_PLAN_MAGIC_SIZE) != 0) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan magic is invalid");
+    }
+
+    offset = CAIRN_BINARY_PLAN_MAGIC_SIZE;
+    binary_version = read_u32_le(contents + offset);
+    offset += 4;
+    registry_version = read_u32_le(contents + offset);
+    offset += 4;
+    if (!copy_fixed_ascii(loaded_registry_sha, sizeof(loaded_registry_sha), contents + offset, 64)) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan registry hash is invalid");
+    }
+    offset += 64;
+    if (!copy_fixed_ascii(loaded_plan_id, sizeof(loaded_plan_id), contents + offset, 64)) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan plan_id is invalid");
+    }
+    offset += 64;
+    loaded_world_size = read_u32_le(contents + offset);
+    offset += 4;
+    loaded_rank = read_u32_le(contents + offset);
+    offset += 4;
+    loaded_microbatch_size = read_u32_le(contents + offset);
+    offset += 4;
+    loaded_op_count = read_u32_le(contents + offset);
+    offset += 4;
+    loaded_segment_count = read_u32_le(contents + offset);
+    offset += 4;
+    loaded_memory_bytes = read_u64_le(contents + offset);
+    offset += 8;
+    loaded_arena_bytes = read_u64_le(contents + offset);
+    offset += 8;
+
+    if (offset != CAIRN_BINARY_PLAN_HEADER_SIZE) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan header size mismatch");
+    }
+    if (binary_version != CAIRN_BINARY_PLAN_VERSION) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan version does not match runtime");
+    }
+    if (registry_version != CAIRN_OP_REGISTRY_VERSION) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan op registry version does not match runtime");
+    }
+    if (strcmp(loaded_registry_sha, CAIRN_OP_REGISTRY_SHA256) != 0) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan op registry hash does not match runtime");
+    }
+    if (loaded_world_size == 0 || loaded_world_size != ctx->desc.world_size) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "runtime world_size does not match binary rank plan");
+    }
+    if (loaded_rank != ctx->desc.global_rank) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "runtime global_rank does not match binary rank plan");
+    }
+    if (loaded_microbatch_size == 0) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan microbatch_size is invalid");
+    }
+    if (loaded_op_count == 0 || loaded_segment_count == 0 || loaded_arena_bytes == 0) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan has empty op or memory tables");
+    }
+    expected_size = CAIRN_BINARY_PLAN_HEADER_SIZE + ((size_t)loaded_segment_count * CAIRN_BINARY_PLAN_SEGMENT_SIZE);
+    if ((size_t)loaded_op_count > (((size_t)-1) - expected_size) / CAIRN_BINARY_PLAN_OP_SIZE) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan op table is too large");
+    }
+    expected_size += (size_t)loaded_op_count * CAIRN_BINARY_PLAN_OP_SIZE;
+    if (contents_size != expected_size) {
+        return set_error(ctx, CAIRN_ERR_PLAN, "binary rank plan size does not match header");
+    }
+
+    loaded_segments = (cairn_memory_segment_t *)calloc((size_t)loaded_segment_count, sizeof(cairn_memory_segment_t));
+    if (loaded_segments == NULL) {
+        return set_error(ctx, CAIRN_ERR_STATE, "binary rank plan memory segments could not be allocated");
+    }
+    loaded_ops = (cairn_plan_op_t *)calloc((size_t)loaded_op_count, sizeof(cairn_plan_op_t));
+    if (loaded_ops == NULL) {
+        free(loaded_segments);
+        return set_error(ctx, CAIRN_ERR_STATE, "binary rank plan op table could not be allocated");
+    }
+
+    previous_end = 0;
+    computed_arena_bytes = 0;
+    for (index = 0; index < loaded_segment_count; index++) {
+        uint64_t segment_end;
+
+        if (!copy_fixed_ascii(loaded_segments[index].name, sizeof(loaded_segments[index].name), contents + offset, 64)) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan memory segment name is invalid");
+        }
+        offset += 64;
+        loaded_segments[index].offset = read_u64_le(contents + offset);
+        offset += 8;
+        loaded_segments[index].nbytes = read_u64_le(contents + offset);
+        offset += 8;
+        if (loaded_segments[index].nbytes == 0) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan memory segment has zero size");
+        }
+        if (loaded_segments[index].offset < previous_end) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan memory segments overlap");
+        }
+        if (UINT64_MAX - loaded_segments[index].offset < loaded_segments[index].nbytes) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan memory segment overflows");
+        }
+        segment_end = loaded_segments[index].offset + loaded_segments[index].nbytes;
+        previous_end = segment_end;
+        if (segment_end > computed_arena_bytes) {
+            computed_arena_bytes = segment_end;
+        }
+    }
+    if (computed_arena_bytes != loaded_arena_bytes) {
+        return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan arena size does not match segments");
+    }
+
+    for (index = 0; index < loaded_op_count; index++) {
+        uint32_t loaded_op_id;
+        uint32_t loaded_class;
+        cairn_op_class_t registry_class;
+
+        loaded_op_id = read_u32_le(contents + offset);
+        offset += 4;
+        loaded_class = read_u32_le(contents + offset);
+        offset += 4;
+        if (loaded_op_id != index) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op ids are not contiguous");
+        }
+        if (loaded_class > (uint32_t)CAIRN_OP_CLASS_IO) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op class is invalid");
+        }
+        loaded_ops[index].op_id = loaded_op_id;
+        loaded_ops[index].op_class = (cairn_op_class_t)loaded_class;
+        if (!copy_fixed_ascii(loaded_ops[index].kind, sizeof(loaded_ops[index].kind), contents + offset, 48)) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op kind is invalid");
+        }
+        offset += 48;
+        if (!copy_fixed_ascii(loaded_ops[index].stream, sizeof(loaded_ops[index].stream), contents + offset, 32)) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op stream is invalid");
+        }
+        offset += 32;
+        loaded_ops[index].bytes = read_u64_le(contents + offset);
+        offset += 8;
+
+        if (!lookup_executor(loaded_ops[index].kind, &registry_class)) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op table contains unsupported op kind");
+        }
+        if (registry_class != loaded_ops[index].op_class) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op class does not match registry");
+        }
+        if (!stream_matches_class(loaded_ops[index].stream, loaded_ops[index].op_class)) {
+            return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan op stream does not match op class");
+        }
+    }
+    if (offset != contents_size) {
+        return fail_binary_plan(ctx, loaded_ops, loaded_segments, "binary rank plan trailing bytes are invalid");
+    }
+
+    clear_plan(ctx);
+    snprintf(ctx->plan_id, sizeof(ctx->plan_id), "%s", loaded_plan_id);
+    ctx->plan_world_size = loaded_world_size;
+    ctx->plan_rank = loaded_rank;
+    ctx->plan_microbatch_size = loaded_microbatch_size;
+    ctx->estimated_memory_bytes = loaded_memory_bytes;
+    ctx->ops = loaded_ops;
+    ctx->op_count = loaded_op_count;
+    ctx->segments = loaded_segments;
+    ctx->segment_count = loaded_segment_count;
+    if (!reserve_arena(ctx, loaded_arena_bytes)) {
+        clear_plan(ctx);
+        return set_error(ctx, CAIRN_ERR_STATE, "memory arena could not be reserved");
+    }
+    ctx->plan_loaded = 1;
+    return CAIRN_OK;
+}
+
 int cairn_init(cairn_context_t **ctx, const cairn_init_desc_t *desc) {
     cairn_context_t *created;
 
@@ -881,6 +1142,12 @@ int cairn_load_plan(cairn_context_t *ctx, const char *path) {
     if (contents == NULL || contents_size == 0) {
         free(contents);
         return set_error(ctx, CAIRN_ERR_IO, "plan file could not be read");
+    }
+    if (contents_size >= CAIRN_BINARY_PLAN_MAGIC_SIZE
+        && memcmp(contents, CAIRN_BINARY_PLAN_MAGIC, CAIRN_BINARY_PLAN_MAGIC_SIZE) == 0) {
+        int status = load_binary_rank_plan(ctx, (const unsigned char *)contents, contents_size);
+        free(contents);
+        return status;
     }
     loaded_plan_id[0] = '\0';
     loaded_world_size = ctx->desc.world_size;

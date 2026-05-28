@@ -8,7 +8,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cairn.compiler import compile_plan
+from cairn.compiler import (
+    BINARY_PLAN_HEADER,
+    BINARY_PLAN_MAGIC,
+    BINARY_PLAN_OP,
+    BINARY_PLAN_SEGMENT,
+    BINARY_PLAN_VERSION,
+    compile_plan,
+)
 from cairn.jsonutil import load_json
 from cairn.mapping import build_comm_groups, build_rank_map
 from cairn.op_registry import OP_REGISTRY_SHA256, OP_REGISTRY_VERSION, supported_op_kinds
@@ -115,12 +122,48 @@ class CompileTests(unittest.TestCase):
             )
             manifest = load_json(Path(out) / "manifest.json")
             rank_plan = load_json(Path(out) / "ranks" / "rank_000000.json")
+            binary_plan = Path(out) / "ranks-bin" / "rank_000000.cairn"
             self.assertEqual(manifest["op_registry_version"], OP_REGISTRY_VERSION)
             self.assertEqual(manifest["op_registry_sha256"], OP_REGISTRY_SHA256)
+            self.assertEqual(manifest["artifacts"]["rank_binary_plans_dir"], "ranks-bin")
             self.assertEqual(rank_plan["op_registry_sha256"], OP_REGISTRY_SHA256)
             kinds = {op["kind"] for op in rank_plan["ops"]}
             self.assertLessEqual(kinds, supported_op_kinds())
             self.assertTrue(all("op_class" in op for op in rank_plan["ops"]))
+            self.assertTrue(binary_plan.exists())
+            binary_header = BINARY_PLAN_HEADER.unpack(binary_plan.read_bytes()[: BINARY_PLAN_HEADER.size])
+            (
+                magic,
+                binary_version,
+                registry_version,
+                registry_sha,
+                plan_id,
+                world_size,
+                global_rank,
+                microbatch_size,
+                op_count,
+                segment_count,
+                estimated_memory_bytes,
+                arena_bytes,
+            ) = binary_header
+            self.assertEqual(magic, BINARY_PLAN_MAGIC)
+            self.assertEqual(binary_version, BINARY_PLAN_VERSION)
+            self.assertEqual(registry_version, OP_REGISTRY_VERSION)
+            self.assertEqual(registry_sha.decode("ascii").rstrip("\0"), OP_REGISTRY_SHA256)
+            self.assertEqual(plan_id.decode("ascii").rstrip("\0"), manifest["plan_id"])
+            self.assertEqual(world_size, manifest["world_size"])
+            self.assertEqual(global_rank, 0)
+            self.assertEqual(microbatch_size, rank_plan["microbatch_size"])
+            self.assertEqual(op_count, len(rank_plan["ops"]))
+            self.assertEqual(segment_count, len(rank_plan["memory"]["segments"]))
+            self.assertEqual(estimated_memory_bytes, rank_plan["memory"]["estimated_bytes_per_rank"])
+            self.assertGreaterEqual(arena_bytes, estimated_memory_bytes)
+            self.assertEqual(
+                binary_plan.stat().st_size,
+                BINARY_PLAN_HEADER.size
+                + (segment_count * BINARY_PLAN_SEGMENT.size)
+                + (op_count * BINARY_PLAN_OP.size),
+            )
 
     def test_simulator_reports_pipeline_and_failure(self) -> None:
         with tempfile.TemporaryDirectory() as out:
