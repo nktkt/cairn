@@ -190,6 +190,14 @@ def build_rank_plan(
     return {
         "version": 1,
         "plan_id": plan_id,
+        "world_size": (
+            training["parallelism"]["tensor"]
+            * training["parallelism"]["pipeline"]
+            * training["parallelism"]["data"]
+            * training["parallelism"].get("context", 1)
+            * training["parallelism"].get("expert", 1)
+        ),
+        "microbatch_size": training["microbatch_size"],
         "rank": rank,
         "streams": STREAMS,
         "layer_assignment": assignment,

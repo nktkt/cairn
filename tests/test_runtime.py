@@ -25,6 +25,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             temp_path = Path(temp)
             plan_dir = temp_path / "plan"
             binary = temp_path / "runtime-smoke"
+            checkpoint = temp_path / "checkpoint.json"
             compile_plan(
                 model=load_example("model"),
                 training=load_example("training"),
@@ -55,7 +56,7 @@ class RuntimeSmokeTests(unittest.TestCase):
             self.assertEqual(compile_result.returncode, 0, compile_result.stderr)
 
             run_result = subprocess.run(
-                [str(binary), str(plan_dir / "manifest.json")],
+                [str(binary), str(plan_dir / "ranks" / "rank_000000.json"), "8", str(checkpoint)],
                 cwd=ROOT,
                 text=True,
                 capture_output=True,
@@ -63,6 +64,19 @@ class RuntimeSmokeTests(unittest.TestCase):
             )
             self.assertEqual(run_result.returncode, 0, run_result.stderr)
             self.assertIn("cairn runtime smoke ok", run_result.stdout)
+            self.assertIn("ops=17", run_result.stdout)
+            self.assertTrue(checkpoint.exists())
+            self.assertEqual(load_json(checkpoint)["step"], 1)
+
+            mismatch_result = subprocess.run(
+                [str(binary), str(plan_dir / "ranks" / "rank_000000.json"), "7", str(temp_path / "bad.json")],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(mismatch_result.returncode, 0)
+            self.assertIn("world_size does not match", mismatch_result.stderr)
 
 
 if __name__ == "__main__":

@@ -42,6 +42,10 @@ int cairn_should_checkpoint(cairn_context_t *ctx);
 int cairn_save_checkpoint(cairn_context_t *ctx, const char *tag);
 int cairn_finalize(cairn_context_t *ctx);
 const char *cairn_last_error(const cairn_context_t *ctx);
+const char *cairn_plan_id(const cairn_context_t *ctx);
+uint64_t cairn_plan_op_count(const cairn_context_t *ctx);
+uint64_t cairn_plan_memory_bytes(const cairn_context_t *ctx);
+uint64_t cairn_current_step(const cairn_context_t *ctx);
 
 #ifdef __cplusplus
 }

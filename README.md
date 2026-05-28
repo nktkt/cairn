@@ -88,7 +88,10 @@ cc -std=c11 -Wall -Wextra -Werror \
   runtime/examples/smoke.c \
   -o /tmp/cairn-runtime-smoke
 
-/tmp/cairn-runtime-smoke build/plan/manifest.json
+/tmp/cairn-runtime-smoke \
+  build/plan/ranks/rank_000000.json \
+  8 \
+  /tmp/cairn-checkpoint.json
 ```
 
 ## What Is Included
